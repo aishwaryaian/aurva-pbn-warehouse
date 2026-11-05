@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#f6f5f1" />
+  <title>Aurva World · PBN Warehouse</title>
+  <link rel="stylesheet" href="/style.css" />
+  <script defer src="/app.js"></script>
+</head>
+<body>
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand"><span class="brand-mark">a<span>.</span></span><div><strong>AURVA WORLD</strong><small>PAINT BY NUMBER · WAREHOUSE</small></div></div>
+    <div class="side-title">WORKSPACE</div>
+    <nav class="navigation" aria-label="Primary navigation">
+      <button data-tab="dashboard" class="nav-button active"><span class="nav-icon">▦</span> Overview</button>
+      <button data-tab="kits" class="nav-button"><span class="nav-icon">◫</span> Packed kits</button>
+      <button data-tab="components" class="nav-button"><span class="nav-icon">◈</span> Components</button>
+      <button data-tab="suppliers" class="nav-button"><span class="nav-icon">↗</span> Suppliers</button>
+      <button data-tab="activity" class="nav-button"><span class="nav-icon">◷</span> Activity</button>
+    </nav>
+    <div class="sidebar-foot">
+      <span class="dot-online"></span> Private warehouse database
+      <p>Shopify-free · Manual handovers</p>
+    </div>
+  </aside>
+  <main class="main-content">
+    <header class="page-header">
+      <div><span class="eyebrow">AURVA / OPERATIONS</span><h1 id="page-title">Warehouse overview</h1><p id="page-subtitle">A clear view of what’s packed, what needs packing, and what to reorder.</p></div>
+      <div class="header-actions"><span id="sync-status" class="sync-status">● Live inventory data</span><button class="btn btn-secondary" data-action="refresh">Refresh ↻</button></div>
+    </header>
+    <div id="content" aria-live="polite"><div class="loading">Loading warehouse…</div></div>
+    <footer class="site-footer">Aurva World · Paint-by-Number Warehouse <span>Keep regular database backups</span></footer>
+  </main>
+</div>
+<div id="modal-overlay" class="overlay hidden" role="presentation">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal-head"><div><span class="eyebrow" id="modal-kicker">WAREHOUSE ACTION</span><h2 id="modal-title"></h2></div><button class="icon-button" aria-label="Close" data-action="close-modal">✕</button></div>
+    <div id="modal-body"></div>
+  </div>
+</div>
+<div id="toast" class="toast hidden" role="status"></div>
+</body>
+</html>

@@ -91,13 +91,13 @@ function kitRow(k){
     +'<td class="number">'+priced(k.selling_price)+'</td>'
     +'<td class="number">'+qty+'</td>'
     +'<td>'+status+'</td>'
-    +'<td>'+(k.recipe_ready?badge('Ready'):badge('Recipe needed','wait'))+'</td>'
+    +'<td>'+(k.recipe_pending_reason?badge('Adhesive pending','wait'):k.recipe_ready?badge('Ready'):badge('Recipe needed','wait'))+'</td>'
     +'<td class="actions">'
     +'<button class="btn btn-small btn-secondary" data-action="edit-kit" data-id="'+k.id+'">Edit details</button>'
     +'<button class="btn btn-small btn-primary" data-action="pack" data-id="'+k.id+'">+ Pack</button>'
     +'<button class="btn btn-small btn-secondary" data-action="handover" data-id="'+k.id+'">− Hand over</button>'
     +'<button class="btn btn-small btn-secondary" data-action="recipe" data-id="'+k.id+'">Recipe</button>'
-    +(!k.recipe_ready && k.recipe.length?'<button class="btn btn-small btn-tinted" data-action="confirm-recipe" data-id="'+k.id+'">Confirm recipe</button>':'')
+    +(!k.recipe_ready && !k.recipe_pending_reason && k.recipe.length?'<button class="btn btn-small btn-tinted" data-action="confirm-recipe" data-id="'+k.id+'">Confirm recipe</button>':'')
     +'<button class="btn btn-small btn-secondary" data-action="count-kit" data-id="'+k.id+'">Count</button></td></tr>';
 }
 function renderKits(){
@@ -122,7 +122,7 @@ function componentRow(c){
 function renderComponents(){
   let comps=DATA.components.filter(c=>`${c.name} ${c.code}`.toLowerCase().includes(SEARCH.toLowerCase()));
   return `<div class="toolbar"><input class="input search" id="list-search" placeholder="Search components…" value="${esc(SEARCH)}" aria-label="Search components"><div class="toolbar-actions"><button class="btn btn-secondary" data-action="convert">⇄ Convert / split stock</button><button class="btn btn-primary" data-action="new-component">+ Add component</button></div></div>
-  <div class="notice">Starter components are included with <b>zero stock</b>; enter your real quantities. Add artwork-specific canvases, stickers, flyers and paint colours as separate components. Set your own minimum stock alert for each component.</div>
+  <div class="notice">Master-recipe components include design-specific canvases, culture brochures, labels, tubes and brush sets. Newly added components start at <b>zero stock</b> until your physical stocktake. Paint strips are calculated separately; liquid paint and adhesive consumption remain deferred/pending.</div>
   <section class="panel">${panelHead('Raw materials & packing parts',`${comps.length} components shown`)}<div class="table-scroll"><table><thead><tr><th>Component</th><th class="number">Available</th><th class="number">Min. level</th><th>Status</th><th>Best listed price</th><th class="actions">Actions</th></tr></thead><tbody>${comps.map(componentRow).join('')}</tbody></table></div></section>`;
 }
 function renderSuppliers(){
@@ -192,7 +192,7 @@ function recipeRow(cid='',qty=''){
 }
 function editRecipe(k){
   const rows=k.recipe.map(r=>recipeRow(r.component_id,r.qty_per_kit)).join('')||recipeRow();
-  modal('Kit component recipe · '+k.sku,`<div class="notice warning">Add <b>all</b> materials used in one kit, including artwork-specific canvas, paints, brush configuration, packaging sticker and wisdom flyer. Six-pot strips and reusable cut sections are managed automatically from the product paint count; do not enter these manually in the recipe. Unknown paint/glue amounts must be measured before you can accurately deduct them. Saving a recipe requires confirmation again.</div><form id="recipe-form"><div class="recipe-actions"><span class="field"><label>Component</label></span><span class="field"><label>Qty per packed kit</label></span></div><div id="recipe-rows">${rows}</div><div class="recipe-actions"><button class="btn btn-secondary btn-small" data-action="add-recipe-row" type="button">+ Add component</button><button class="btn btn-secondary btn-small" data-action="standard-recipe" data-id="${k.id}" type="button">Add known common parts</button></div>${formButtons('Save component recipe')}</form>`, 'BILL OF MATERIALS');
+  modal('Kit component recipe · '+k.sku,`<div class="notice warning">${k.recipe_pending_reason?'<b>Recipe saved, but packing is locked:</b> '+esc(k.recipe_pending_reason)+'. ':''}The saved master recipe includes a design-specific canvas, brochure and label, along with both rods, a 2-brush set, one hook packet’s separate contents, and a correctly sized tube. The empty paint-strip requirement is calculated automatically, with reusable offcuts. Paint fill is ${k.paint_fill_ml??'unconfirmed'} mL per pot (reference only; liquid paint inventory is deferred). Adhesive consumption is not deducted until measured. Saving changes requires recipe confirmation again.</div><form id="recipe-form"><div class="recipe-actions"><span class="field"><label>Component</label></span><span class="field"><label>Qty per packed kit</label></span></div><div id="recipe-rows">${rows}</div><div class="recipe-actions"><button class="btn btn-secondary btn-small" data-action="add-recipe-row" type="button">+ Add component</button><button class="btn btn-secondary btn-small" data-action="standard-recipe" data-id="${k.id}" type="button">Add known common parts</button></div>${formButtons('Save component recipe')}</form>`, 'BILL OF MATERIALS');
   $('#recipe-form').addEventListener('submit',async ev=>{
     ev.preventDefault();let items=$$('.recipe-row',$('#recipe-rows'));
     const recipe=items.map(row=>({component_id:$('.recipe-component',row).value,qty_per_kit:$('.recipe-qty',row).value})).filter(x=>x.component_id||x.qty_per_kit);
@@ -201,7 +201,7 @@ function editRecipe(k){
   });
 }
 function standardParts(k){
-  const known=[['CORD-CM',50],['HOOK',2],['ZIPLOCK',1],['HANG-INSTRUCT',1],[k.size==='A3'?'TUBE-A3':'TUBE-A5-A4',1],['WOOD-CM',k.size==='A5'?31.6:k.size==='A4'?44:61.4]];
+  const known = k.size==='A5' ? [] : [['CORD-CM',50],['HOOK',2],['ZIPLOCK',1],['HANG-INSTRUCT',1],[k.size==='A3'?'TUBE-A3':'TUBE-A4',1],['WOOD-CM',k.size==='A3'?60:42],['BRUSH-2SET',1]];
   const rows=$$('#recipe-rows .recipe-row');const existing=new Set(rows.map(x=>$('.recipe-component',x).value).filter(Boolean));
   let added=0;
   for(const [code,qty] of known){

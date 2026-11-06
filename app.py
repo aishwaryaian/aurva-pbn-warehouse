@@ -33,6 +33,44 @@ SECURE_MODE = RAILWAY or HOST not in ('127.0.0.1', 'localhost', '::1')
 LOCK = threading.RLock()
 THRESHOLD = 10
 
+# Verified active PBN catalogue, without A5 variants pending phase-out count.
+# Barcode strings deliberately retain their leading zeros.
+CATALOGUE_VERSION = 'aurva_pbn_active_catalogue_2026_11_06_v1'
+PRODUCT_CATALOGUE = [
+    ('PNFA3-91-0001', 'The Painted Gateway', 'Where Walls Become Art', 'A3', 'EAN-13-0608028960384', 1299, 1299),
+    ('PNFA3-91-0002', 'The Folk Trance', 'Echoes of the Desert Sands', 'A3', 'EAN-13-0608028960360', 1299, 1299),
+    ('PNFA3-91-0003', 'Varanasi Ghats', 'Where the Sacred River Meets the Soul', 'A3', 'EAN-13-0608028960483', 1199, 1199),
+    ('PN0A4-91-0002', 'The Reading Nook', 'Stories, Silence, and Sunlight', 'A4', 'EAN-13-0608028960407', 899, 899),
+    ('PN0A4-91-0004', 'Goldi, the Fish', 'Grace in Motion', 'A4', 'EAN-13-0608028960445', 899, 899),
+    ('PN0A4-91-0007', 'Olive Ridley Sea Turtle', 'The Ocean Wanderer', 'A4', 'EAN-13-0608028960469', 899, 899),
+    ('PN0A4-91-0005', 'The Sarus Crane', 'The Eternal Pair', 'A4', 'EAN-13-0608028960476', 899, 899),
+    ('PN0A4-91-0006', 'The Indian Peacock', 'The Monsoon Dancer', 'A4', 'EAN-13-0608028960452', 899, 899),
+    ('PN0A4-91-0003', 'The Good Old Days', 'Whiskers at the Café', 'A4', 'EAN-13-0608028960377', 899, 899),
+]
+
+
+def check_barcode(barcode):
+    """Allow blank or user-provided format; verify explicitly labelled EAN-13."""
+    barcode = str(barcode or '').strip()
+    if len(barcode) > 80:
+        raise Problem('Barcode is too long.')
+    if barcode.startswith('EAN-13-'):
+        digits = barcode[7:]
+        if len(digits) != 13 or not digits.isascii() or not digits.isdigit():
+            raise Problem('An EAN-13 barcode must have exactly 13 digits (including leading zeros).')
+        total = sum(int(n) * (1 if i % 2 == 0 else 3) for i,n in enumerate(digits[:12]))
+        expected = (10-total%10)%10
+        if int(digits[-1]) != expected:
+            raise Problem('EAN-13 checksum failed; check the barcode printed on the product.')
+    return barcode
+
+
+def optional_price(value, label):
+    if value is None or value == '':
+        return None
+    return number(value, label)
+
+
 class Problem(Exception):
     def __init__(self, msg, status=400, extra=None):
         self.msg, self.status, self.extra = msg, status, extra or {}
@@ -146,6 +184,10 @@ def init_db():
           name TEXT NOT NULL, size TEXT NOT NULL CHECK(size IN ('A5','A4','A3')),
           packed_qty INTEGER NOT NULL DEFAULT 0 CHECK(packed_qty>=0),
           recipe_ready INTEGER NOT NULL DEFAULT 0 CHECK(recipe_ready IN (0,1)),
+          subtitle TEXT NOT NULL DEFAULT '',
+          barcode TEXT NOT NULL DEFAULT '',
+          mrp REAL, selling_price REAL,
+          stock_counted INTEGER NOT NULL DEFAULT 0 CHECK(stock_counted IN (0,1)),
           created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS components (
@@ -173,6 +215,9 @@ def init_db():
           id INTEGER PRIMARY KEY, supplier_id INTEGER NOT NULL REFERENCES suppliers(id),
           price REAL NOT NULL, changed_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS app_migrations (
+          migration TEXT PRIMARY KEY, applied_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS activity (
           id INTEGER PRIMARY KEY, category TEXT NOT NULL,
           description TEXT NOT NULL, occurred_at TEXT NOT NULL
@@ -180,8 +225,39 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_recipes_component ON recipes(component_id);
         CREATE INDEX IF NOT EXISTS idx_activity_time ON activity(occurred_at);
     ''')
+    # Non-destructive migration: preserve all existing inventory, recipes and audit data.
+    columns = {row[1] for row in conn.execute('PRAGMA table_info(kits)')}
+    for column, spec in (
+        ('subtitle', "TEXT NOT NULL DEFAULT ''"),
+        ('barcode', "TEXT NOT NULL DEFAULT ''"),
+        ('mrp', 'REAL'),
+        ('selling_price', 'REAL'),
+        ('stock_counted', 'INTEGER NOT NULL DEFAULT 0'),
+    ):
+        if column not in columns:
+            conn.execute(f'ALTER TABLE kits ADD COLUMN {column} {spec}')
+    if 'stock_counted' not in columns:
+        conn.execute('''UPDATE kits SET stock_counted=1
+            WHERE packed_qty>0 OR EXISTS (
+              SELECT 1 FROM activity WHERE activity.category='Packed stock count'
+              AND activity.description LIKE kits.sku || ':%'
+            )''')
     if conn.execute('SELECT COUNT(*) FROM components').fetchone()[0] == 0:
         seed_components(conn)
+    if not conn.execute('SELECT 1 FROM app_migrations WHERE migration=?', (CATALOGUE_VERSION,)).fetchone():
+        for sku, name, subtitle, size, barcode, mrp, price in PRODUCT_CATALOGUE:
+            check_barcode(barcode)
+            conn.execute('''INSERT INTO kits
+                (sku, name, subtitle, size, barcode, mrp, selling_price, packed_qty, stock_counted, created_at)
+                VALUES (?,?,?,?,?,?,?,0,0,?)
+                ON CONFLICT(sku) DO UPDATE SET
+                    name=excluded.name, subtitle=excluded.subtitle,
+                    size=excluded.size, barcode=excluded.barcode,
+                    mrp=excluded.mrp, selling_price=excluded.selling_price''',
+                (sku,name,subtitle,size,barcode,mrp,price,now()))
+        conn.execute('INSERT INTO app_migrations (migration,applied_at) VALUES (?,?)',
+                     (CATALOGUE_VERSION,now()))
+        audit(conn, 'Catalogue imported', '9 A3/A4 products imported; packed stock not counted and existing quantities preserved')
     conn.commit()
     conn.close()
 
@@ -203,7 +279,7 @@ def state():
         b = [r for r in recipes if r['kit_id'] == k['id']]
         k['recipe'] = b
         k['can_make'] = min((int((compmap[r['component_id']]['qty'] + 1e-8)//r['qty_per_kit']) for r in b), default=None) if k['recipe_ready'] and b else None
-        k['low_stock'] = k['packed_qty'] <= THRESHOLD
+        k['low_stock'] = bool(k['stock_counted']) and k['packed_qty'] <= THRESHOLD
     return {'kits':kits,'components':components,'suppliers':suppliers, 'price_history':history,
             'activity':activity,'threshold':THRESHOLD,'timestamp':now()}
 
@@ -214,12 +290,39 @@ def create_kit(body):
     size = clean(body.get('size'), 'Size')
     if size not in ('A5','A4','A3'):
         raise Problem('Size must be A5, A4 or A3.')
-    initial = nonneg_int(body.get('packed_qty',0), 'Opening packed stock')
+    initial_raw = body.get('packed_qty')
+    counted = initial_raw is not None and str(initial_raw).strip() != ''
+    initial = nonneg_int(initial_raw, 'Opening packed stock') if counted else 0
+    subtitle = str(body.get('subtitle') or '').strip()
+    if len(subtitle) > 160:
+        raise Problem('Subtitle must be 160 characters or fewer.')
+    barcode = check_barcode(body.get('barcode'))
+    mrp = optional_price(body.get('mrp'), 'MRP')
+    price = optional_price(body.get('selling_price'), 'Selling price')
     with transaction() as conn:
-        cur = conn.execute('INSERT INTO kits (sku,name,size,packed_qty,created_at) VALUES (?,?,?,?,?)',
-                           (sku,name,size,initial,now()))
-        audit(conn,'Kit created',f'{sku} — {name} ({size}), opening packed stock {initial}')
+        cur = conn.execute('''INSERT INTO kits
+            (sku,name,size,packed_qty,stock_counted,subtitle,barcode,mrp,selling_price,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?)''',
+            (sku,name,size,initial,int(counted),subtitle,barcode,mrp,price,now()))
+        audit(conn,'Kit created',f'{sku} — {name} ({size}), opening packed stock '+(str(initial) if counted else 'not counted'))
         return {'id':cur.lastrowid}
+
+
+def update_kit(kid, body):
+    # Edit catalogue fields without changing inventory quantities.
+    with transaction() as conn:
+        kit = fetchrow(conn, 'kits', kid)
+        name = clean(body.get('name', kit['name']), 'Product name')
+        subtitle = str(body.get('subtitle', kit['subtitle']) or '').strip()
+        if len(subtitle) > 160:
+            raise Problem('Subtitle must be 160 characters or fewer.')
+        barcode = check_barcode(body.get('barcode', kit['barcode']))
+        mrp = optional_price(body.get('mrp', kit['mrp']), 'MRP')
+        price = optional_price(body.get('selling_price', kit['selling_price']), 'Selling price')
+        conn.execute('''UPDATE kits SET name=?, subtitle=?, barcode=?, mrp=?, selling_price=?
+                        WHERE id=?''',(name,subtitle,barcode,mrp,price,kid))
+        audit(conn, 'Catalogue updated', f'{kit["sku"]}: product details updated')
+        return {'ok':True}
 
 
 def create_component(body):
@@ -352,7 +455,7 @@ def pack_kits(kid, body):
             raise Problem('Insufficient components to pack even one kit: '+ '; '.join(missing),409)
         for r in items:
             conn.execute('UPDATE components SET qty=ROUND(qty-?,4) WHERE id=?',(round(qty*r['qty_per_kit'],4),r['component_id']))
-        conn.execute('UPDATE kits SET packed_qty=packed_qty+? WHERE id=?',(qty,kid))
+        conn.execute('UPDATE kits SET packed_qty=packed_qty+?, stock_counted=1 WHERE id=?',(qty,kid))
         audit(conn,'Packed batch',f'{kit["sku"]}: packed +{qty} kit(s); {len(items)} component types deducted'+(f' (requested {requested})' if requested!=qty else ''))
         return {'packed':qty,'requested':requested,'limited':qty<requested}
 
@@ -372,7 +475,7 @@ def count_kit(kid,body):
     qty=nonneg_int(body.get('quantity'),'Physical packed stock count')
     with transaction() as conn:
         kit=fetchrow(conn,'kits',kid)
-        conn.execute('UPDATE kits SET packed_qty=? WHERE id=?',(qty,kid))
+        conn.execute('UPDATE kits SET packed_qty=?, stock_counted=1 WHERE id=?',(qty,kid))
         audit(conn,'Packed stock count',f'{kit["sku"]}: corrected from {kit["packed_qty"]} to {qty}')
         return {'ok':True}
 
@@ -414,6 +517,8 @@ def route(method,path,body):
     if method!='POST':
         raise Problem('Route not found.',404)
     if path=='/api/kits': return create_kit(body)
+    m=re.fullmatch(r'/api/kits/(\d+)/update',path)
+    if m: return update_kit(int(m.group(1)),body)
     if path=='/api/components': return create_component(body)
     if path=='/api/convert': return convert_component(body)
     if path=='/api/suppliers': return create_supplier(body)

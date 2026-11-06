@@ -51,6 +51,72 @@ class WarehouseSmokeTests(unittest.TestCase):
                 raise
             return json.loads(e.read())
 
+    def test_cuttable_paint_strips_and_catalogue(self):
+        state = self.get('/api/state')
+        active = {k['sku']: k for k in state['kits']}
+        expected = {
+            'PNFA3-91-0001': 15, 'PNFA3-91-0002': 15,
+            'PNFA3-91-0003': 18, 'PN0A4-91-0002': 15,
+            'PN0A4-91-0004': 12, 'PN0A4-91-0007': 12,
+            'PN0A4-91-0005': 10, 'PN0A4-91-0006': 8,
+            'PN0A4-91-0003': 15
+        }
+        for sku, pots in expected.items():
+            self.assertEqual(active[sku]['paint_colours'], pots)
+            self.assertFalse(active[sku]['stock_counted'])
+            self.assertEqual(active[sku]['packed_qty'], 0)
+        components = {c['code']: c for c in state['components']}
+        for code in ['EMPTY-6POT']+[f'EMPTY-CUT-{i}' for i in range(1,6)]:
+            self.assertEqual(components[code]['qty'], 0)
+        # Five purchased six-pot strips can make two kits of fifteen pots.
+        # The first pack creates a reusable three-pot remnant for the second.
+        full = components['EMPTY-6POT']
+        self.post(f'/api/components/{full["id"]}/count', {'qty': 5})
+        kid = self.post('/api/kits', {'sku': 'PBN-CUT-15', 'name': 'Cutting test',
+                                   'size': 'A4', 'paint_colours': 15})['id']
+        canvas = self.post('/api/components', {'code':'CAN-CUT-15',
+                           'name':'Paint cutting test canvas', 'unit':'pcs',
+                           'qty':3, 'min_qty':0,'purchase_multiplier':1,
+                           'purchase_unit':'canvas'})['id']
+        self.post(f'/api/kits/{kid}/recipe', {
+            'items':[{'component_id':canvas, 'qty_per_kit':1}]})
+        self.post(f'/api/kits/{kid}/confirm-recipe',{})
+        current = next(k for k in self.get('/api/state')['kits'] if k['id'] == kid)
+        self.assertEqual(current['can_make'], 2)
+        result = self.post(f'/api/kits/{kid}/pack', {'quantity':2})
+        self.assertEqual(result['packed'],2)
+        self.assertEqual(result['full_paint_strips_used'],5)
+        after = self.get('/api/state')
+        c = {x['code']: x for x in after['components']}
+        self.assertEqual(c['EMPTY-6POT']['qty'],0)
+        self.assertTrue(all(c[f'EMPTY-CUT-{i}']['qty']==0 for i in range(1,6)))
+        self.assertEqual(next(k for k in after['kits'] if k['id']==kid)['packed_qty'],2)
+        self.assertEqual(next(x for x in after['components'] if x['id']==canvas)['qty'],1)
+        blocked = self.post(f'/api/kits/{kid}/pack', {'quantity':1}, 409)
+        self.assertIn('connected',blocked['error'].lower())
+        # One fifteen-pot kit leaves a connected three-pot remnant.
+        self.post(f'/api/components/{full["id"]}/count', {'qty':3})
+        result = self.post(f'/api/kits/{kid}/pack', {'quantity':1})
+        self.assertEqual(result['packed'],1)
+        c = {x['code']: x for x in self.get('/api/state')['components']}
+        self.assertEqual(c['EMPTY-6POT']['qty'],0)
+        self.assertEqual(c['EMPTY-CUT-3']['qty'],1)
+        # The leftover can be reused for a future design without buying strips.
+        kid3 = self.post('/api/kits', {'sku':'PBN-CUT-3','name':'Three-pot test',
+                          'size':'A4','paint_colours':3})['id']
+        canvas3 = self.post('/api/components', {'code':'CAN-CUT-3',
+                            'name':'Three-pot cutting test canvas','unit':'pcs',
+                            'qty':1,'min_qty':0,'purchase_multiplier':1,
+                            'purchase_unit':'canvas'})['id']
+        self.post(f'/api/kits/{kid3}/recipe', {
+            'items':[{'component_id':canvas3,'qty_per_kit':1}]})
+        self.post(f'/api/kits/{kid3}/confirm-recipe',{})
+        result = self.post(f'/api/kits/{kid3}/pack', {'quantity':1})
+        self.assertEqual(result['packed'],1)
+        self.assertEqual(result['full_paint_strips_used'],0)
+        c = {x['code']: x for x in self.get('/api/state')['components']}
+        self.assertEqual(c['EMPTY-CUT-3']['qty'],0)
+
     def test_warehouse_flow(self):
         s=self.get('/api/state')
         self.assertGreaterEqual(len(s['components']),13)

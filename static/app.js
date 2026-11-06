@@ -82,6 +82,7 @@ function kitRow(k){
     +(k.subtitle?'<span class="row-sub">'+esc(k.subtitle)+'</span>':'')
     +'<span class="row-sub mono">'+esc(k.sku)+'</span></td>'
     +'<td>'+esc(k.size)+'</td>'
+    +'<td>'+(k.paint_colours==null?'<span class="row-sub">Not set</span>':esc(k.paint_colours)+' colours · '+esc(k.paint_strips_per_kit)+' strips')+'</td>'
     +'<td class="mono">'+esc(k.barcode||'—')+'</td>'
     +'<td class="number">'+priced(k.mrp)+'</td>'
     +'<td class="number">'+priced(k.selling_price)+'</td>'
@@ -101,12 +102,12 @@ function renderKits(){
   const rows = kits.map(kitRow).join('');
   return '<div class="toolbar"><input class="input search" id="list-search" placeholder="Search name, barcode or SKU…" value="'+esc(SEARCH)+'" aria-label="Search products">'
     +'<div class="toolbar-actions"><button class="btn btn-primary" data-action="new-kit">+ Add PBN kit</button></div></div>'
-    +'<div class="notice"><b>Active catalogue:</b> 9 A3/A4 variants with recorded SKUs, EAN-13 barcodes, MRPs and selling prices. '
+    +'<div class="notice"><b>Active catalogue:</b> 9 A3/A4 variants with recorded SKUs, EAN-13 barcodes, MRPs and selling prices. Enter the paint colours per design to automatically calculate empty connected 6-pot strips. '
     +'Packed stock remains <b>Not counted</b> until you complete the physical stocktake. '
     +'Six A5 phase-out variants and their raw materials will be recorded separately later.</div>'
     +'<section class="panel">'+panelHead('PBN product catalogue',fmt(DATA.kits.length)+' registered SKUs · '+fmt(DATA.kits.filter(k=>!k.stock_counted).length)+' awaiting stock count')
     +'<div class="table-scroll"><table style="min-width:1150px"><thead><tr>'
-    +'<th>Artwork / SKU</th><th>Size</th><th>Barcode</th><th class="number">MRP</th><th class="number">Selling price</th>'
+    +'<th>Artwork / SKU</th><th>Size</th><th>Paint / 6-pot strips</th><th>Barcode</th><th class="number">MRP</th><th class="number">Selling price</th>'
     +'<th class="number">Packed stock</th><th>Stock status</th><th>Component recipe</th><th class="actions">Actions</th></tr></thead>'
     +'<tbody>'+rows+'</tbody></table></div></section>';
 }
@@ -140,6 +141,7 @@ function newKit(){
     input('Internal SKU','sku','text','e.g. PNFA3-91-0004','', 'required')
     +input('Artwork name','name','text','Product name','', 'required')
     +input('Product subtitle','subtitle','text','Optional')
+    +input('Paint colours / pots per kit','paint_colours','number','Leave blank until confirmed','','min="1" max="240" step="1"')
     +selector('Canvas size','size',['A5','A4','A3'].map(x=>({value:x,label:x})),'A4')
     +input('Barcode (preserve leading zero)','barcode','text','EAN-13-…')
     +input('MRP (₹)','mrp','number','Optional','','min="0.01" step="any"')
@@ -152,10 +154,11 @@ function editKit(k){
   formModal('Edit product · '+k.sku,
     input('Artwork name','name','text','',k.name,'required')
     +input('Product subtitle','subtitle','text','',k.subtitle||'')
+    +input('Paint colours / pots per kit','paint_colours','number','Leave blank until confirmed',k.paint_colours==null?'':k.paint_colours,'min="1" max="240" step="1"')
     +input('Barcode (preserve leading zeros)','barcode','text','EAN-13-…',k.barcode||'')
     +input('MRP (₹)','mrp','number','Optional',k.mrp==null?'':k.mrp,'min="0.01" step="any"')
     +input('Regular selling price (₹)','selling_price','number','Optional',k.selling_price==null?'':k.selling_price,'min="0.01" step="any"')
-    +'<div class="wide notice"><b>SKU '+esc(k.sku)+' · '+esc(k.size)+'</b>. Only product details are updated; packed stock and recipes are unchanged.</div>',
+    +'<div class="wide notice"><b>SKU '+esc(k.sku)+' · '+esc(k.size)+'</b>. One connected strip holds 6 pots. The app calculates the full strips required automatically (rounding up). Changing the colour count updates the EMPTY-6POT recipe and requires recipe confirmation again; no stock is deducted until kits are packed.</div>',
     'Save product details',async form=>{await request('/api/kits/'+k.id+'/update',Object.fromEntries(new FormData(form)));return 'Product details updated.';},'EDIT PRODUCT');
 }
 function newComponent(){
@@ -186,7 +189,7 @@ function recipeRow(cid='',qty=''){
 }
 function editRecipe(k){
   const rows=k.recipe.map(r=>recipeRow(r.component_id,r.qty_per_kit)).join('')||recipeRow();
-  modal('Kit component recipe · '+k.sku,`<div class="notice warning">Add <b>all</b> materials used in one kit, including artwork-specific canvas, paints, brush configuration, packaging sticker and wisdom flyer. Unknown paint/glue amounts must be measured before you can accurately deduct them. Saving a recipe requires confirmation again.</div><form id="recipe-form"><div class="recipe-actions"><span class="field"><label>Component</label></span><span class="field"><label>Qty per packed kit</label></span></div><div id="recipe-rows">${rows}</div><div class="recipe-actions"><button class="btn btn-secondary btn-small" data-action="add-recipe-row" type="button">+ Add component</button><button class="btn btn-secondary btn-small" data-action="standard-recipe" data-id="${k.id}" type="button">Add known common parts</button></div>${formButtons('Save component recipe')}</form>`, 'BILL OF MATERIALS');
+  modal('Kit component recipe · '+k.sku,`<div class="notice warning">Add <b>all</b> materials used in one kit, including artwork-specific canvas, paints, brush configuration, packaging sticker and wisdom flyer. Six-pot empty strips are calculated automatically from the product colour count. Unknown paint/glue amounts must be measured before you can accurately deduct them. Saving a recipe requires confirmation again.</div><form id="recipe-form"><div class="recipe-actions"><span class="field"><label>Component</label></span><span class="field"><label>Qty per packed kit</label></span></div><div id="recipe-rows">${rows}</div><div class="recipe-actions"><button class="btn btn-secondary btn-small" data-action="add-recipe-row" type="button">+ Add component</button><button class="btn btn-secondary btn-small" data-action="standard-recipe" data-id="${k.id}" type="button">Add known common parts</button></div>${formButtons('Save component recipe')}</form>`, 'BILL OF MATERIALS');
   $('#recipe-form').addEventListener('submit',async ev=>{
     ev.preventDefault();let items=$$('.recipe-row',$('#recipe-rows'));
     const recipe=items.map(row=>({component_id:$('.recipe-component',row).value,qty_per_kit:$('.recipe-qty',row).value})).filter(x=>x.component_id||x.qty_per_kit);

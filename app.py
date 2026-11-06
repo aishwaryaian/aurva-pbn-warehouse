@@ -65,6 +65,33 @@ def check_barcode(barcode):
     return barcode
 
 
+def paint_colour_count(value):
+    """Count of individual paint pots in one kit; blank means unknown."""
+    if value is None or str(value).strip() == '':
+        return None
+    n = positive_int(value, 'Paint colours per kit')
+    if n > 240:
+        raise Problem('Paint colours per kit must be 240 or fewer.')
+    return n
+
+
+def sync_paint_strip_recipe(conn, kit_id, colours):
+    """Update recipe requirements without changing existing physical stock."""
+    if colours is None:
+        # Existing recipe remains for human review when count is cleared.
+        conn.execute('UPDATE kits SET recipe_ready=0 WHERE id=?', (kit_id,))
+        return
+    strip = conn.execute('SELECT id FROM components WHERE code=?', ('EMPTY-6POT',)).fetchone()
+    if not strip:
+        raise Problem('Missing EMPTY-6POT component.')
+    strips = (colours + 5) // 6
+    conn.execute("""INSERT INTO recipes (kit_id,component_id,qty_per_kit)
+                    VALUES (?,?,?) ON CONFLICT(kit_id,component_id)
+                    DO UPDATE SET qty_per_kit=excluded.qty_per_kit""",
+                 (kit_id,strip['id'],strips))
+    conn.execute('UPDATE kits SET recipe_ready=0 WHERE id=?', (kit_id,))
+
+
 def optional_price(value, label):
     if value is None or value == '':
         return None
@@ -188,6 +215,7 @@ def init_db():
           barcode TEXT NOT NULL DEFAULT '',
           mrp REAL, selling_price REAL,
           stock_counted INTEGER NOT NULL DEFAULT 0 CHECK(stock_counted IN (0,1)),
+          paint_colours INTEGER CHECK(paint_colours IS NULL OR (paint_colours>0 AND paint_colours<=240)),
           created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS components (
@@ -233,6 +261,7 @@ def init_db():
         ('mrp', 'REAL'),
         ('selling_price', 'REAL'),
         ('stock_counted', 'INTEGER NOT NULL DEFAULT 0'),
+        ('paint_colours', 'INTEGER'),
     ):
         if column not in columns:
             conn.execute(f'ALTER TABLE kits ADD COLUMN {column} {spec}')
@@ -278,6 +307,7 @@ def state():
     for k in kits:
         b = [r for r in recipes if r['kit_id'] == k['id']]
         k['recipe'] = b
+        k['paint_strips_per_kit'] = ((k['paint_colours']+5)//6) if k['paint_colours'] is not None else None
         k['can_make'] = min((int((compmap[r['component_id']]['qty'] + 1e-8)//r['qty_per_kit']) for r in b), default=None) if k['recipe_ready'] and b else None
         k['low_stock'] = bool(k['stock_counted']) and k['packed_qty'] <= THRESHOLD
     return {'kits':kits,'components':components,'suppliers':suppliers, 'price_history':history,

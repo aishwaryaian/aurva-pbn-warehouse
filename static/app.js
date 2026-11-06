@@ -54,7 +54,7 @@ function panelHead(title,sub='',button=''){return `<div class="section-head"><di
 function empty(title,sub){return `<div class="empty"><strong>${esc(title)}</strong>${esc(sub)}</div>`;}
 
 function render(){
-  const titles={dashboard:['Warehouse overview','Packed stock, component availability and reordering — all in one place.'],kits:['Packed kits','Record new batches and hand over packed kits to the sales team.'],components:['Component inventory','Track raw materials, receive stock and configure minimum levels.'],suppliers:['Suppliers & reordering','Compare purchase prices, save product links and track price history.'],activity:['Warehouse activity','An audit trail of packing, handovers and inventory changes.']};
+  const titles={dashboard:['Warehouse overview','Packed stock, component availability and reordering — all in one place.'],kits:['Products & stock','Product catalogue, prices, barcodes, packing batches and physical stock counts.'],components:['Component inventory','Track raw materials, receive stock and configure minimum levels.'],suppliers:['Suppliers & reordering','Compare purchase prices, save product links and track price history.'],activity:['Warehouse activity','An audit trail of packing, handovers and inventory changes.']};
   $('#page-title').textContent=titles[TAB][0];$('#page-subtitle').textContent=titles[TAB][1];
   $$('.nav-button').forEach(b=>b.classList.toggle('active',b.dataset.tab===TAB));
   $('#content').innerHTML=({dashboard:renderDashboard,kits:renderKits,components:renderComponents,suppliers:renderSuppliers,activity:renderActivity})[TAB]();
@@ -69,19 +69,46 @@ function renderDashboard(){
       const quotes=DATA.suppliers.filter(s=>s.component_id===c.id).sort((a,b)=>a.price-b.price);
       return `<div class="low-row"><div><div class="name">${esc(c.name)}</div><div class="meta">${fmt(c.qty)} ${esc(c.unit)} available · minimum ${fmt(c.min_qty)}</div></div><div>${quotes[0]?.url?`<a class="btn btn-small btn-secondary" href="${esc(quotes[0].url)}" target="_blank" rel="noopener noreferrer">Reorder ↗</a>`:`<button class="btn btn-small btn-secondary" data-action="new-supplier" data-component="${c.id}">Add supplier</button>`}</div></div>`;
   }).join(''):empty('No components below minimum','Set a minimum stock level on the Components page to enable alerts.');
-  return `<div class="stats">${stat('Packed kits in stock',total,'Across all artwork SKUs','emphasis')}${stat('Product designs / sizes',DATA.kits.length,'Tracked as individual SKUs')}${stat('Pack-new-batch alerts',kitLow.length,'At 10 or fewer packed kits','alert')}${stat('Components to reorder',componentLow.length,'Based on your chosen minimum levels')}</div>
+  return (DATA.kits.some(k=>!k.stock_counted)?'<div class="notice warning"><b>Stocktake pending:</b> newly added products show Not counted until you perform a physical count. They do not trigger low-stock alerts yet.</div>':'')+`<div class="stats">${stat('Packed kits in stock',total,'Counted and recorded kits only','emphasis')}${stat('Product designs / sizes',DATA.kits.length,'Tracked as individual SKUs')}${stat('Pack-new-batch alerts',kitLow.length,'At 10 or fewer packed kits','alert')}${stat('Components to reorder',componentLow.length,'Based on your chosen minimum levels')}</div>
   <div class="split-grid"><section class="panel">${panelHead('Needs a new packing batch','Automatically flags any SKU with ≤ 10 packed kits',`<button class="btn btn-secondary btn-small" data-tab="kits">View all kits</button>`)}<div class="list-items">${notices}</div></section>
   <section class="panel">${panelHead('Component alerts','Reorder links appear when available',`<button class="btn btn-secondary btn-small" data-tab="components">Components</button>`)}<div class="list-items">${compNotices}</div></section></div>
   <div style="height:24px"></div><div class="panel">${panelHead('Recent warehouse activity','Packing, handovers and stock movements')}${activityList(6)}</div>`;
 }
 function kitRow(k){
-  return `<tr><td><span class="row-title">${esc(k.name)}</span><span class="row-sub mono">${esc(k.sku)}</span></td><td>${esc(k.size)}</td><td class="number ${k.low_stock?'qty-low':'qty-ok'}">${fmt(k.packed_qty)}</td><td>${k.low_stock?badge('Pack new batch','bad'):badge('Healthy')}</td><td>${k.recipe_ready?badge('Ready'):badge('Recipe needed','wait')}</td><td class="actions"><button class="btn btn-small btn-primary" data-action="pack" data-id="${k.id}">+ Pack</button><button class="btn btn-small btn-secondary" data-action="handover" data-id="${k.id}">− Hand over</button><button class="btn btn-small btn-secondary" data-action="recipe" data-id="${k.id}">Recipe</button>${!k.recipe_ready&&k.recipe.length?`<button class="btn btn-small btn-tinted" data-action="confirm-recipe" data-id="${k.id}">Confirm recipe</button>`:''}<button class="btn btn-small btn-secondary" data-action="count-kit" data-id="${k.id}">Count</button></td></tr>`;
+  const qty = k.stock_counted ? fmt(k.packed_qty) : 'Not counted';
+  const status = !k.stock_counted ? badge('Awaiting count','wait') : k.low_stock ? badge('Pack new batch','bad') : badge('Healthy');
+  const priced = n => n == null ? '—' : money(n);
+  return '<tr><td><span class="row-title">'+esc(k.name)+'</span>'
+    +(k.subtitle?'<span class="row-sub">'+esc(k.subtitle)+'</span>':'')
+    +'<span class="row-sub mono">'+esc(k.sku)+'</span></td>'
+    +'<td>'+esc(k.size)+'</td>'
+    +'<td class="mono">'+esc(k.barcode||'—')+'</td>'
+    +'<td class="number">'+priced(k.mrp)+'</td>'
+    +'<td class="number">'+priced(k.selling_price)+'</td>'
+    +'<td class="number">'+qty+'</td>'
+    +'<td>'+status+'</td>'
+    +'<td>'+(k.recipe_ready?badge('Ready'):badge('Recipe needed','wait'))+'</td>'
+    +'<td class="actions">'
+    +'<button class="btn btn-small btn-secondary" data-action="edit-kit" data-id="'+k.id+'">Edit details</button>'
+    +'<button class="btn btn-small btn-primary" data-action="pack" data-id="'+k.id+'">+ Pack</button>'
+    +'<button class="btn btn-small btn-secondary" data-action="handover" data-id="'+k.id+'">− Hand over</button>'
+    +'<button class="btn btn-small btn-secondary" data-action="recipe" data-id="'+k.id+'">Recipe</button>'
+    +(!k.recipe_ready && k.recipe.length?'<button class="btn btn-small btn-tinted" data-action="confirm-recipe" data-id="'+k.id+'">Confirm recipe</button>':'')
+    +'<button class="btn btn-small btn-secondary" data-action="count-kit" data-id="'+k.id+'">Count</button></td></tr>';
 }
 function renderKits(){
-  let kits=DATA.kits.filter(k=>`${k.name} ${k.sku} ${k.size}`.toLowerCase().includes(SEARCH.toLowerCase()));
-  return `<div class="toolbar"><input class="input search" id="list-search" placeholder="Search by SKU or artwork…" value="${esc(SEARCH)}" aria-label="Search kits"><div class="toolbar-actions"><button class="btn btn-primary" data-action="new-kit">+ Add PBN kit</button></div></div>
-  <div class="notice">A kit becomes <b>packed stock</b> when you record a packed batch. Handovers reduce packed stock. The low-stock alert is fixed at <b>10 kits or fewer</b>.</div>
-  <section class="panel">${panelHead('Packed products',`${fmt(DATA.kits.length)} SKUs · ${fmt(DATA.kits.reduce((a,k)=>a+k.packed_qty,0))} packed kits`)}${DATA.kits.length?`<div class="table-scroll"><table><thead><tr><th>Artwork / SKU</th><th>Size</th><th class="number">Packed</th><th>Stock status</th><th>Component recipe</th><th class="actions">Actions</th></tr></thead><tbody>${kits.map(kitRow).join('')}</tbody></table></div>`:empty('No PBN kits yet','Start by adding your first artwork and size SKU.')}</section>`;
+  const kits = DATA.kits.filter(k => [k.name,k.subtitle,k.sku,k.barcode,k.size].join(' ').toLowerCase().includes(SEARCH.toLowerCase()));
+  const rows = kits.map(kitRow).join('');
+  return '<div class="toolbar"><input class="input search" id="list-search" placeholder="Search name, barcode or SKU…" value="'+esc(SEARCH)+'" aria-label="Search products">'
+    +'<div class="toolbar-actions"><button class="btn btn-primary" data-action="new-kit">+ Add PBN kit</button></div></div>'
+    +'<div class="notice"><b>Active catalogue:</b> 9 A3/A4 variants with recorded SKUs, EAN-13 barcodes, MRPs and selling prices. '
+    +'Packed stock remains <b>Not counted</b> until you complete the physical stocktake. '
+    +'Six A5 phase-out variants and their raw materials will be recorded separately later.</div>'
+    +'<section class="panel">'+panelHead('PBN product catalogue',fmt(DATA.kits.length)+' registered SKUs · '+fmt(DATA.kits.filter(k=>!k.stock_counted).length)+' awaiting stock count')
+    +'<div class="table-scroll"><table style="min-width:1150px"><thead><tr>'
+    +'<th>Artwork / SKU</th><th>Size</th><th>Barcode</th><th class="number">MRP</th><th class="number">Selling price</th>'
+    +'<th class="number">Packed stock</th><th>Stock status</th><th>Component recipe</th><th class="actions">Actions</th></tr></thead>'
+    +'<tbody>'+rows+'</tbody></table></div></section>';
 }
 function componentRow(c){
   const low=c.min_qty>0&&c.qty<=c.min_qty;
@@ -109,8 +136,27 @@ function activityList(limit=80){
 function renderActivity(){return `<div class="panel">${panelHead('Inventory change history','Shows the most recent 80 changes')}${activityList()}</div>`;}
 
 function newKit(){
-  formModal('Add a PBN kit',input('Internal SKU','sku','text','e.g. PBN-READ-A4','', 'required')+input('Artwork name','name','text','e.g. Reading Nook','', 'required')+selector('Canvas size','size',['A5','A4','A3'].map(x=>({value:x,label:x})),'A4')+input('Opening packed stock','packed_qty','number','0','0','min="0" step="1" required')+
-  `<div class="wide notice">Enter only kits that are already fully packed. Next, add the component recipe for this SKU before recording new packing batches.</div>`, 'Create kit',async form=>{await request('/api/kits',Object.fromEntries(new FormData(form)));return 'Kit added. Now open Recipe to define its components.';},'NEW PACKED PRODUCT');
+  formModal('Add a PBN kit',
+    input('Internal SKU','sku','text','e.g. PNFA3-91-0004','', 'required')
+    +input('Artwork name','name','text','Product name','', 'required')
+    +input('Product subtitle','subtitle','text','Optional')
+    +selector('Canvas size','size',['A5','A4','A3'].map(x=>({value:x,label:x})),'A4')
+    +input('Barcode (preserve leading zero)','barcode','text','EAN-13-…')
+    +input('MRP (₹)','mrp','number','Optional','','min="0.01" step="any"')
+    +input('Regular selling price (₹)','selling_price','number','Optional','','min="0.01" step="any"')
+    +input('Opening packed stock — optional','packed_qty','number','Leave blank until physical count','','min="0" step="1"')
+    +'<div class="wide notice"><b>Leave stock blank</b> until counted. This will show Not counted rather than zero.</div>',
+    'Create kit',async form=>{await request('/api/kits',Object.fromEntries(new FormData(form)));return 'Product created. Stock can be counted later.';},'PRODUCT CATALOGUE');
+}
+function editKit(k){
+  formModal('Edit product · '+k.sku,
+    input('Artwork name','name','text','',k.name,'required')
+    +input('Product subtitle','subtitle','text','',k.subtitle||'')
+    +input('Barcode (preserve leading zeros)','barcode','text','EAN-13-…',k.barcode||'')
+    +input('MRP (₹)','mrp','number','Optional',k.mrp==null?'':k.mrp,'min="0.01" step="any"')
+    +input('Regular selling price (₹)','selling_price','number','Optional',k.selling_price==null?'':k.selling_price,'min="0.01" step="any"')
+    +'<div class="wide notice"><b>SKU '+esc(k.sku)+' · '+esc(k.size)+'</b>. Only product details are updated; packed stock and recipes are unchanged.</div>',
+    'Save product details',async form=>{await request('/api/kits/'+k.id+'/update',Object.fromEntries(new FormData(form)));return 'Product details updated.';},'EDIT PRODUCT');
 }
 function newComponent(){
   formModal('Add a component',input('Component code','code','text','e.g. CANVAS-READ-A4','', 'required')+input('Component name','name','text','e.g. Reading Nook printed canvas A4','', 'required')+selector('Stock tracking unit','unit',['pcs','set','strip','tube','cm','ml','g'].map(x=>({value:x,label:x})),'pcs')+input('Opening stock in component units','qty','number','0','0','min="0" step="any" required')+input('Minimum stock warning level','min_qty','number','0','0','min="0" step="any" required')+input('Units added per purchase unit','purchase_multiplier','number','1','1','min="0.0001" step="any" required')+input('Purchase unit label','purchase_unit','text','e.g. sheet / bottle / unit','unit','required')+
@@ -187,6 +233,7 @@ async function runAction(action,id,el){
     case 'refresh':await load();toast('Inventory refreshed.');break;
     case 'close-modal':closeModal();break;
     case 'new-kit':newKit();break;
+    case 'edit-kit':editKit(kitById(id));break;
     case 'new-component':newComponent();break;
     case 'new-supplier':addSupplier(el.dataset.component||'');break;
     case 'edit-component':editComponent(compById(id));break;

@@ -51,6 +51,11 @@ PAINT_COUNTS = {
     'PN0A4-91-0003': 15,
 }
 
+# Confirmed A3/A4 bill of materials, without any A5 or physical stock counts.
+MASTER_RECIPES_VERSION = 'aurva_pbn_a3_a4_master_recipes_2026_11_06_v1'
+ADHESIVE_PENDING_REASON = 'Adhesive consumption has not yet been measured'
+PAINT_FILL_ML = 3.0
+
 PRODUCT_CATALOGUE = [
     ('PNFA3-91-0001', 'The Painted Gateway', 'Where Walls Become Art', 'A3', 'EAN-13-0608028960384', 1299, 1299),
     ('PNFA3-91-0002', 'The Folk Trance', 'Echoes of the Desert Sands', 'A3', 'EAN-13-0608028960360', 1299, 1299),
@@ -280,6 +285,8 @@ def init_db():
           mrp REAL, selling_price REAL,
           stock_counted INTEGER NOT NULL DEFAULT 0 CHECK(stock_counted IN (0,1)),
           paint_colours INTEGER CHECK(paint_colours IS NULL OR (paint_colours>0 AND paint_colours<=240)),
+          recipe_pending_reason TEXT NOT NULL DEFAULT '',
+          paint_fill_ml REAL,
           created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS components (
@@ -326,6 +333,8 @@ def init_db():
         ('selling_price', 'REAL'),
         ('stock_counted', 'INTEGER NOT NULL DEFAULT 0'),
         ('paint_colours', 'INTEGER'),
+        ('recipe_pending_reason', "TEXT NOT NULL DEFAULT ''"),
+        ('paint_fill_ml', 'REAL'),
     ):
         if column not in columns:
             conn.execute(f'ALTER TABLE kits ADD COLUMN {column} {spec}')
@@ -373,6 +382,59 @@ def init_db():
                      (PAINT_COUNTS_VERSION,now()))
         audit(conn,'Paint counts imported',
               'Nine confirmed paint-pot counts stored; cuttable-strip planning enabled; existing physical stock unchanged')
+    if not conn.execute('SELECT 1 FROM app_migrations WHERE migration=?',
+                        (MASTER_RECIPES_VERSION,)).fetchone():
+        # New item records are empty until the real stocktake. Do not touch any
+        # existing quantities, component prices, suppliers, or A5 recipes.
+        common = [
+            ('BRUSH-2SET', 'Ready-made set of 2 paint brushes', 'set'),
+            ('TUBE-A4', 'A4 packaging tube including end caps', 'pcs'),
+        ]
+        for sku, name, subtitle, size, barcode, mrp, price in PRODUCT_CATALOGUE:
+            common.extend([
+                (f'CANVAS-{sku}', f'{name} — printed {size} canvas', 'pcs'),
+                (f'BROCHURE-{sku}', f'{name} — culture brochure', 'pcs'),
+                (f'LABEL-{sku}', f'{name} — packaging tube label', 'pcs'),
+            ])
+        for code, name, unit in common:
+            conn.execute('''INSERT INTO components
+                (code,name,unit,qty,min_qty,purchase_multiplier,purchase_unit)
+                VALUES (?,?,?,0,0,1,?) ON CONFLICT(code) DO NOTHING''',
+                (code,name,unit,unit))
+        components_by_code = {row[0]: row[1] for row in conn.execute(
+            'SELECT code,id FROM components')}
+        for sku, name, subtitle, size, barcode, mrp, price in PRODUCT_CATALOGUE:
+            kit = conn.execute('SELECT id FROM kits WHERE sku=?',(sku,)).fetchone()
+            if kit is None:
+                raise RuntimeError(f'Cannot apply recipe, expected SKU missing: {sku}')
+            requirements = {
+                f'CANVAS-{sku}':1,
+                'WOOD-CM':60 if size=='A3' else 42,
+                'BRUSH-2SET':1,
+                f'BROCHURE-{sku}':1,
+                'ZIPLOCK':1,
+                'HOOK':2,
+                'HANG-INSTRUCT':1,
+                'CORD-CM':50,
+                'TUBE-A3' if size=='A3' else 'TUBE-A4':1,
+                f'LABEL-{sku}':1,
+            }
+            # Only the nine named active-kit recipes are intentionally replaced.
+            # Existing arbitrary/A5 recipes and ALL physical stock remain intact.
+            conn.execute('DELETE FROM recipes WHERE kit_id=?',(kit[0],))
+            for code, quantity in requirements.items():
+                cid = components_by_code.get(code)
+                if cid is None:
+                    raise RuntimeError(f'Missing recipe component: {code}')
+                conn.execute('INSERT INTO recipes (kit_id,component_id,qty_per_kit) VALUES (?,?,?)',
+                             (kit[0],cid,quantity))
+            conn.execute('''UPDATE kits SET recipe_ready=0, recipe_pending_reason=?,
+                            paint_fill_ml=? WHERE id=?''',
+                         (ADHESIVE_PENDING_REASON, PAINT_FILL_ML,kit[0]))
+        conn.execute('INSERT INTO app_migrations (migration,applied_at) VALUES (?,?)',
+                     (MASTER_RECIPES_VERSION, now()))
+        audit(conn,'Master recipes imported',
+              'A3/A4 BOMs saved for 9 active kits; adhesive unmeasured, recipes blocked; all stock unchanged')
     conn.commit()
     conn.close()
 
@@ -393,6 +455,9 @@ def state():
     for k in kits:
         b = [r for r in recipes if r['kit_id'] == k['id']]
         k['recipe'] = b
+        k['total_paint_fill_ml'] = (k['paint_colours'] * k['paint_fill_ml']
+                                     if k['paint_colours'] is not None and k['paint_fill_ml'] is not None
+                                     else None)
         k['paint_strips_per_kit'] = ((k['paint_colours']+5)//6) if k['paint_colours'] is not None else None
         k['full_strips_per_kit'] = k['paint_colours']//6 if k['paint_colours'] is not None else None
         k['cut_pots_per_kit'] = k['paint_colours']%6 if k['paint_colours'] is not None else None
@@ -570,6 +635,9 @@ def confirm_recipe(kid):
         count=conn.execute('SELECT COUNT(*) FROM recipes WHERE kit_id=?',(kid,)).fetchone()[0]
         if not count:
             raise Problem('Add components to the recipe before confirming it.')
+        if kit['recipe_pending_reason']:
+            raise Problem('Cannot confirm this recipe yet: '+kit['recipe_pending_reason']+
+                          '. No adhesive quantity will be guessed.',409)
         if kit['paint_colours'] is not None:
             stale = conn.execute("""SELECT 1 FROM recipes r JOIN components c ON c.id=r.component_id
                 WHERE r.kit_id=? AND (c.code='EMPTY-6POT' OR c.code LIKE 'EMPTY-CUT-%')
@@ -585,6 +653,8 @@ def pack_kits(kid, body):
     requested = positive_int(body.get('quantity'), 'Packed quantity')
     with transaction() as conn:
         kit = fetchrow(conn,'kits',kid)
+        if kit['recipe_pending_reason']:
+            raise Problem('Packing is blocked: '+kit['recipe_pending_reason']+'.',409)
         if not kit['recipe_ready']:
             raise Problem('Confirm the kit recipe before packing. This prevents missing component deductions.',409)
         items=conn.execute('''SELECT r.*,c.qty AS available,c.name,c.unit,c.code

@@ -329,11 +329,14 @@ def create_kit(body):
     barcode = check_barcode(body.get('barcode'))
     mrp = optional_price(body.get('mrp'), 'MRP')
     price = optional_price(body.get('selling_price'), 'Selling price')
+    colours = paint_colour_count(body.get('paint_colours'))
     with transaction() as conn:
         cur = conn.execute('''INSERT INTO kits
-            (sku,name,size,packed_qty,stock_counted,subtitle,barcode,mrp,selling_price,created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?)''',
-            (sku,name,size,initial,int(counted),subtitle,barcode,mrp,price,now()))
+            (sku,name,size,packed_qty,stock_counted,subtitle,barcode,mrp,selling_price,paint_colours,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+            (sku,name,size,initial,int(counted),subtitle,barcode,mrp,price,colours,now()))
+        if colours is not None:
+            sync_paint_strip_recipe(conn,cur.lastrowid,colours)
         audit(conn,'Kit created',f'{sku} — {name} ({size}), opening packed stock '+(str(initial) if counted else 'not counted'))
         return {'id':cur.lastrowid}
 
@@ -349,9 +352,13 @@ def update_kit(kid, body):
         barcode = check_barcode(body.get('barcode', kit['barcode']))
         mrp = optional_price(body.get('mrp', kit['mrp']), 'MRP')
         price = optional_price(body.get('selling_price', kit['selling_price']), 'Selling price')
-        conn.execute('''UPDATE kits SET name=?, subtitle=?, barcode=?, mrp=?, selling_price=?
-                        WHERE id=?''',(name,subtitle,barcode,mrp,price,kid))
-        audit(conn, 'Catalogue updated', f'{kit["sku"]}: product details updated')
+        colours = paint_colour_count(body.get('paint_colours', kit['paint_colours']))
+        conn.execute('''UPDATE kits SET name=?, subtitle=?, barcode=?, mrp=?, selling_price=?, paint_colours=?
+                        WHERE id=?''',(name,subtitle,barcode,mrp,price,colours,kid))
+        if colours != kit['paint_colours']:
+            sync_paint_strip_recipe(conn,kid,colours)
+        audit(conn, 'Catalogue updated', f'{kit["sku"]}: product details updated'+
+              (f'; {colours} paint pots, {(colours+5)//6} strips per kit' if colours is not None and colours != kit['paint_colours'] else ''))
         return {'ok':True}
 
 
@@ -450,6 +457,12 @@ def save_recipe(kid, body):
         kit = fetchrow(conn,'kits',kid)
         for cid in parsed:
             fetchrow(conn,'components',cid)
+        if kit['paint_colours'] is not None:
+            # Connected-strip requirement always follows the saved paint pot count.
+            strip = conn.execute('SELECT id FROM components WHERE code=?', ('EMPTY-6POT',)).fetchone()
+            if not strip:
+                raise Problem('Missing EMPTY-6POT component.')
+            parsed[strip['id']] = (kit['paint_colours']+5)//6
         conn.execute('DELETE FROM recipes WHERE kit_id=?',(kid,))
         for cid,qty in parsed.items():
             conn.execute('INSERT INTO recipes (kit_id,component_id,qty_per_kit) VALUES (?,?,?)',(kid,cid,qty))
@@ -464,6 +477,13 @@ def confirm_recipe(kid):
         count=conn.execute('SELECT COUNT(*) FROM recipes WHERE kit_id=?',(kid,)).fetchone()[0]
         if not count:
             raise Problem('Add components to the recipe before confirming it.')
+        if kit['paint_colours'] is not None:
+            strip = conn.execute('SELECT id FROM components WHERE code=?', ('EMPTY-6POT',)).fetchone()
+            expected = (kit['paint_colours']+5)//6
+            actual = conn.execute('SELECT qty_per_kit FROM recipes WHERE kit_id=? AND component_id=?',
+                                  (kid,strip['id'] if strip else -1)).fetchone()
+            if actual is None or actual[0] != expected:
+                raise Problem('Paint strip recipe is not synchronized with the colour count.',409)
         conn.execute('UPDATE kits SET recipe_ready=1 WHERE id=?',(kid,))
         audit(conn,'Recipe confirmed',f'{kit["sku"]}: recipe confirmed complete')
         return {'ok':True}

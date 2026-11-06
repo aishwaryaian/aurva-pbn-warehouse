@@ -51,6 +51,55 @@ class WarehouseSmokeTests(unittest.TestCase):
                 raise
             return json.loads(e.read())
 
+    def test_a3_a4_confirmed_recipes_are_synced_but_locked(self):
+        state=self.get('/api/state')
+        kits={k['sku']: k for k in state['kits']}
+        comps={c['id']:c for c in state['components']}
+        bycode={c['code']:c for c in state['components']}
+        expected={
+            'PNFA3-91-0001':('A3',15),
+            'PNFA3-91-0002':('A3',15),
+            'PNFA3-91-0003':('A3',18),
+            'PN0A4-91-0002':('A4',15),
+            'PN0A4-91-0004':('A4',12),
+            'PN0A4-91-0007':('A4',12),
+            'PN0A4-91-0005':('A4',10),
+            'PN0A4-91-0006':('A4',8),
+            'PN0A4-91-0003':('A4',15)
+        }
+        self.assertFalse(any(k['size']=='A5' for k in kits.values()))
+        for sku,(size,pots) in expected.items():
+            k=kits[sku]
+            self.assertEqual(k['size'],size)
+            self.assertEqual(k['paint_fill_ml'],3)
+            self.assertEqual(k['total_paint_fill_ml'],pots*3)
+            self.assertFalse(k['recipe_ready'])
+            self.assertIn('Adhesive',k['recipe_pending_reason'])
+            self.assertFalse(k['stock_counted'])
+            self.assertEqual(k['packed_qty'],0)
+            recipe={comps[x['component_id']]['code']:x['qty_per_kit']
+                    for x in k['recipe']}
+            self.assertEqual(recipe,{
+                'CANVAS-'+sku:1,
+                'WOOD-CM':60 if size=='A3' else 42,
+                'BRUSH-2SET':1,
+                'BROCHURE-'+sku:1,
+                'LABEL-'+sku:1,
+                'ZIPLOCK':1,'HOOK':2,'HANG-INSTRUCT':1,'CORD-CM':50,
+                'TUBE-A3' if size=='A3' else 'TUBE-A4':1})
+            self.assertEqual(bycode['CANVAS-'+sku]['qty'],0)
+            self.assertEqual(bycode['BROCHURE-'+sku]['qty'],0)
+            self.assertEqual(bycode['LABEL-'+sku]['qty'],0)
+            res=self.post(f'/api/kits/{k["id"]}/confirm-recipe',{},409)
+            self.assertIn('adhesive',res['error'].lower())
+            blocked=self.post(f'/api/kits/{k["id"]}/pack',{'quantity':1},409)
+            self.assertIn('adhesive',blocked['error'].lower())
+        self.assertEqual(bycode['BRUSH-2SET']['qty'],0)
+        self.assertEqual(bycode['TUBE-A4']['qty'],0)
+        # The deferred A5 stock is neither seeded nor marked as a confirmed recipe.
+        self.assertFalse(any('A5' in x['code'] and x['code'].startswith('CANVAS-')
+                             for x in bycode.values()))
+
     def test_cuttable_paint_strips_and_catalogue(self):
         state = self.get('/api/state')
         active = {k['sku']: k for k in state['kits']}

@@ -394,7 +394,13 @@ def state():
         b = [r for r in recipes if r['kit_id'] == k['id']]
         k['recipe'] = b
         k['paint_strips_per_kit'] = ((k['paint_colours']+5)//6) if k['paint_colours'] is not None else None
+        k['full_strips_per_kit'] = k['paint_colours']//6 if k['paint_colours'] is not None else None
+        k['cut_pots_per_kit'] = k['paint_colours']%6 if k['paint_colours'] is not None else None
         k['can_make'] = min((int((compmap[r['component_id']]['qty'] + 1e-8)//r['qty_per_kit']) for r in b), default=None) if k['recipe_ready'] and b else None
+        if k['can_make'] is not None and k['paint_colours'] is not None:
+            _, _, full_available, leftover_sections = paint_stock(components)
+            k['can_make'] = plan_paint_strips(full_available, leftover_sections,
+                                              k['paint_colours'], k['can_make'])['packed']
         k['low_stock'] = bool(k['stock_counted']) and k['packed_qty'] <= THRESHOLD
     return {'kits':kits,'components':components,'suppliers':suppliers, 'price_history':history,
             'activity':activity,'threshold':THRESHOLD,'timestamp':now()}
@@ -544,11 +550,12 @@ def save_recipe(kid, body):
         for cid in parsed:
             fetchrow(conn,'components',cid)
         if kit['paint_colours'] is not None:
-            # Connected-strip requirement always follows the saved paint pot count.
-            strip = conn.execute('SELECT id FROM components WHERE code=?', ('EMPTY-6POT',)).fetchone()
-            if not strip:
-                raise Problem('Missing EMPTY-6POT component.')
-            parsed[strip['id']] = (kit['paint_colours']+5)//6
+            paint_components = {c['id'] for c in conn.execute(
+                "SELECT id FROM components WHERE code='EMPTY-6POT' OR code LIKE 'EMPTY-CUT-%'")}
+            if paint_components.intersection(parsed):
+                raise Problem('Paint strips and cut sections are tracked automatically from the colour count. Remove them from the manual recipe.')
+        if not parsed:
+            raise Problem('Add artwork-specific and other non-paint components to the recipe.')
         conn.execute('DELETE FROM recipes WHERE kit_id=?',(kid,))
         for cid,qty in parsed.items():
             conn.execute('INSERT INTO recipes (kit_id,component_id,qty_per_kit) VALUES (?,?,?)',(kid,cid,qty))
@@ -564,12 +571,11 @@ def confirm_recipe(kid):
         if not count:
             raise Problem('Add components to the recipe before confirming it.')
         if kit['paint_colours'] is not None:
-            strip = conn.execute('SELECT id FROM components WHERE code=?', ('EMPTY-6POT',)).fetchone()
-            expected = (kit['paint_colours']+5)//6
-            actual = conn.execute('SELECT qty_per_kit FROM recipes WHERE kit_id=? AND component_id=?',
-                                  (kid,strip['id'] if strip else -1)).fetchone()
-            if actual is None or actual[0] != expected:
-                raise Problem('Paint strip recipe is not synchronized with the colour count.',409)
+            stale = conn.execute("""SELECT 1 FROM recipes r JOIN components c ON c.id=r.component_id
+                WHERE r.kit_id=? AND (c.code='EMPTY-6POT' OR c.code LIKE 'EMPTY-CUT-%')
+                LIMIT 1""", (kid,)).fetchone()
+            if stale:
+                raise Problem('Paint strip sections are automatic. Remove the old manual strip recipe row.', 409)
         conn.execute('UPDATE kits SET recipe_ready=1 WHERE id=?',(kid,))
         audit(conn,'Recipe confirmed',f'{kit["sku"]}: recipe confirmed complete')
         return {'ok':True}
@@ -581,19 +587,45 @@ def pack_kits(kid, body):
         kit = fetchrow(conn,'kits',kid)
         if not kit['recipe_ready']:
             raise Problem('Confirm the kit recipe before packing. This prevents missing component deductions.',409)
-        items=conn.execute('SELECT r.*,c.qty AS available,c.name,c.unit,c.code FROM recipes r JOIN components c ON r.component_id=c.id WHERE r.kit_id=?',(kid,)).fetchall()
+        items=conn.execute('''SELECT r.*,c.qty AS available,c.name,c.unit,c.code
+            FROM recipes r JOIN components c ON r.component_id=c.id
+            WHERE r.kit_id=?''',(kid,)).fetchall()
         if not items:
             raise Problem('This kit has no components in its recipe.',409)
+        if kit['paint_colours'] is not None and any(
+            r['code']=='EMPTY-6POT' or r['code'].startswith('EMPTY-CUT-') for r in items
+        ):
+            raise Problem('Remove obsolete strip rows from this recipe before packing.',409)
         can_make = max(0,min(int((r['available']+1e-8)//r['qty_per_kit']) for r in items))
         qty = min(requested,can_make)
-        if qty<=0:
-            missing=[f'{r["name"]} (need {r["qty_per_kit"]:g} {r["unit"]}, have {r["available"]:g})' for r in items if r['available']+1e-8<r['qty_per_kit']]
+        strip_plan = None
+        full_component = None
+        cut_components = None
+        cut_before = None
+        if kit['paint_colours'] is not None:
+            stock_rows = conn.execute("""SELECT id,code,qty FROM components
+                WHERE code='EMPTY-6POT' OR code LIKE 'EMPTY-CUT-%'""").fetchall()
+            full_component, cut_components, full_qty, cut_before = paint_stock(stock_rows)
+            strip_plan = plan_paint_strips(full_qty,cut_before,kit['paint_colours'],qty)
+            qty = strip_plan['packed']
+        if qty <= 0:
+            missing=[f'{r["name"]} (need {r["qty_per_kit"]:g} {r["unit"]}, have {r["available"]:g})'
+                     for r in items if r['available']+1e-8<r['qty_per_kit']]
+            if strip_plan is not None and strip_plan['packed']<=0 and can_make>0:
+                missing.append('Not enough connected full strips and reusable cut sections')
             raise Problem('Insufficient components to pack even one kit: '+ '; '.join(missing),409)
         for r in items:
-            conn.execute('UPDATE components SET qty=ROUND(qty-?,4) WHERE id=?',(round(qty*r['qty_per_kit'],4),r['component_id']))
+            conn.execute('UPDATE components SET qty=ROUND(qty-?,4) WHERE id=?',
+                         (round(qty*r['qty_per_kit'],4),r['component_id']))
+        if strip_plan is not None:
+            apply_paint_plan(conn,full_component,cut_components,cut_before,strip_plan)
         conn.execute('UPDATE kits SET packed_qty=packed_qty+?, stock_counted=1 WHERE id=?',(qty,kid))
-        audit(conn,'Packed batch',f'{kit["sku"]}: packed +{qty} kit(s); {len(items)} component types deducted'+(f' (requested {requested})' if requested!=qty else ''))
-        return {'packed':qty,'requested':requested,'limited':qty<requested}
+        strip_note = (f'; {strip_plan["full_used"]} full paint strips consumed, cut remnants adjusted'
+                      if strip_plan is not None else '')
+        audit(conn,'Packed batch',f'{kit["sku"]}: packed +{qty} kit(s); {len(items)} recipe components deducted'
+              +strip_note+(f' (requested {requested})' if requested!=qty else ''))
+        return {'packed':qty,'requested':requested,'limited':qty<requested,
+                'full_paint_strips_used':strip_plan['full_used'] if strip_plan else None}
 
 
 def handover(kid,body):

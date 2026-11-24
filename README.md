@@ -24,4 +24,18 @@ This is a small-team prototype with one shared account, not an enterprise multi-
 
 **Known details included:** 50 cm cord and 2 hooks per kit; 6 hanging instructions per A4 printing sheet; A5/A4 share tube size, A3 separate; 4 packaging stickers per A3 sheet at ₹22; 4 wisdom flyers per A3 sheet at ₹42. Wood consumption and bulk paint usage still require real measurements, and are **not** automatically guessed. All these details should be verified for the specific SKU before its component recipe is confirmed.
 
+## Where the data lives
+
+Everything (designs, parts, recipes, supplier links, price history and the activity log) is stored in one **SQLite** database file.
+On Railway that file is `/data/aurva.db` on the attached persistent volume; when running locally it is `data/aurva.db` next to `app.py`.
+The sidebar in the app always shows the database path in use.
+
+## Using the app
+
+- **Sign in** on the login page with `AURVA_USER` / `AURVA_PASSWORD` (you stay signed in for 14 days on that device).
+- **Pack orders**: type how many kits you packed for each design and save. Every part in that design's recipe is deducted automatically, including paint strips. Switch to *Sent out / handed over* to reduce packed stock.
+- **Low-stock alerts**: a design alerts at **10 or fewer** packed kits. A part alerts when only enough is left for 10 kits (for example 20 hooks or 500 cm cord), or at your own minimum if you set one.
+- **Reorder links**: save supplier links and prices per part; low parts are listed first with a one-click *Reorder* button.
+- **Unlock packing**: designs whose adhesive use isn't measured yet start locked. *Unlock packing* lets you pack them now without deducting adhesive.
+
 **Test:** `python test_app.py` runs a temporary local smoke test.

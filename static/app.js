@@ -1,280 +1,486 @@
 'use strict';
-let DATA = {kits:[],components:[],suppliers:[],activity:[],price_history:[],threshold:10};
-let TAB='dashboard';
-let SEARCH='';
+let DATA = {kits:[],components:[],suppliers:[],activity:[],price_history:[],threshold:10,database:{}};
+let TAB = 'dashboard';
+let SEARCH = '';
+let PACK_MODE = 'pack';           // 'pack' = packed (uses parts) | 'handover' = sent out
+let PACK_QTY = {};                // kit id -> number typed on Pack orders page
+let REORDER_FILTER = 'low';
 let TOAST_TIMEOUT;
 
-const $=(s,root=document)=>root.querySelector(s);
-const $$=(s,root=document)=>Array.from(root.querySelectorAll(s));
-const esc=(s)=>String(s??'').replace(/[&<>"']/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]));
-const fmt=(n)=>Number(n??0).toLocaleString('en-IN',{maximumFractionDigits:3});
-const money=(n)=>'₹'+Number(n??0).toLocaleString('en-IN',{maximumFractionDigits:2,minimumFractionDigits:2});
-const fval=(form,name)=>form.elements.namedItem(name)?.value?.trim()??'';
-const input=(label,name,type='text',placeholder='',value='',extra='')=>`<div class="field"><label for="field-${esc(name)}">${esc(label)}</label><input class="input" id="field-${esc(name)}" type="${type}" name="${esc(name)}" placeholder="${esc(placeholder)}" value="${esc(value)}" ${extra}></div>`;
-const selector=(label,name,options,selected)=>`<div class="field"><label for="field-${esc(name)}">${esc(label)}</label><select class="select" id="field-${esc(name)}" name="${esc(name)}">${options.map(o=>`<option value="${esc(o.value)}" ${String(o.value)===String(selected)?'selected':''}>${esc(o.label)}</option>`).join('')}</select></div>`;
-const optionComp=(selected='')=>`<option value="">Choose component…</option>`+DATA.components.map(c=>`<option value="${c.id}" ${String(selected)===String(c.id)?'selected':''}>${esc(c.name)} (${esc(c.unit)})</option>`).join('');
-const formButtons=(submit='Save changes')=>`<div class="form-buttons"><button class="btn btn-secondary" type="button" data-action="close-modal">Cancel</button><button class="btn btn-primary" type="submit">${esc(submit)} →</button></div>`;
-const kitById=(id)=>DATA.kits.find(k=>k.id===Number(id));
-const compById=(id)=>DATA.components.find(c=>c.id===Number(id));
-const supplierById=(id)=>DATA.suppliers.find(c=>c.id===Number(id));
-const badge=(text,type='')=>`<span class="pill ${type}">${esc(text)}</span>`;
+const $ = (s, root = document) => root.querySelector(s);
+const $$ = (s, root = document) => Array.from(root.querySelectorAll(s));
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, x => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]));
+const fmt = (n) => Number(n ?? 0).toLocaleString('en-IN', {maximumFractionDigits: 2});
+const money = (n) => '₹' + Number(n ?? 0).toLocaleString('en-IN', {maximumFractionDigits: 2, minimumFractionDigits: 2});
+const fval = (form, name) => form.elements.namedItem(name)?.value?.trim() ?? '';
+const plural = (n, one, many) => `${fmt(n)} ${n === 1 ? one : (many || one + 's')}`;
+const input = (label, name, type = 'text', placeholder = '', value = '', extra = '') =>
+  `<div class="field"><label for="f-${esc(name)}">${esc(label)}</label><input class="input" id="f-${esc(name)}" type="${type}" name="${esc(name)}" placeholder="${esc(placeholder)}" value="${esc(value)}" ${extra}></div>`;
+const selector = (label, name, options, selected) =>
+  `<div class="field"><label for="f-${esc(name)}">${esc(label)}</label><select class="select" id="f-${esc(name)}" name="${esc(name)}">${options.map(o => `<option value="${esc(o.value)}" ${String(o.value) === String(selected) ? 'selected' : ''}>${esc(o.label)}</option>`).join('')}</select></div>`;
+const optionComp = (selected = '') => `<option value="">Choose a part…</option>` + DATA.components.map(c => `<option value="${c.id}" ${String(selected) === String(c.id) ? 'selected' : ''}>${esc(c.name)} (${esc(c.unit)})</option>`).join('');
+const formButtons = (submit = 'Save') => `<div class="form-buttons"><button class="btn btn-secondary" type="button" data-action="close-modal">Cancel</button><button class="btn btn-primary" type="submit">${esc(submit)}</button></div>`;
+const kitById = (id) => DATA.kits.find(k => k.id === Number(id));
+const compById = (id) => DATA.components.find(c => c.id === Number(id));
+const supplierById = (id) => DATA.suppliers.find(s => s.id === Number(id));
+const pill = (text, type = '') => `<span class="pill ${type}">${esc(text)}</span>`;
+const linksFor = (cid) => DATA.suppliers.filter(s => s.component_id === cid).sort((a, b) => a.price - b.price);
+const safeUrl = (u) => /^https?:\/\//i.test(u || '') ? u : '';
 
-async function request(path,body){
-  const opts=body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)};
+/* ---------------- Server ---------------- */
+async function request(path, body) {
+  const opts = body === undefined ? {} : {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)};
   let resp;
-  try{resp=await fetch(path,opts);}catch(err){throw new Error('Cannot reach the warehouse server. Check the Railway deployment status.');}
-  let obj;try{obj=await resp.json();}catch(e){throw new Error('The server returned an invalid response.');}
-  if(!resp.ok)throw new Error(obj.error||`Request failed (${resp.status}).`);
+  try { resp = await fetch(path, opts); }
+  catch (err) { throw new Error('Cannot reach the warehouse server. Check your internet connection.'); }
+  let obj;
+  try { obj = await resp.json(); } catch (e) { throw new Error('The server returned an unexpected response.'); }
+  if (resp.status === 401 && obj.login) { window.location.href = '/login'; throw new Error('Please sign in again.'); }
+  if (!resp.ok) throw new Error(obj.error || `Request failed (${resp.status}).`);
   return obj;
 }
-async function load(){
-  DATA=await request('/api/state');
+async function load() {
+  DATA = await request('/api/state');
   render();
-  $('#sync-status').textContent='● Live inventory data';
+  setSync(true);
 }
-function toast(message,error=false){
-  const el=$('#toast');el.textContent=message;el.classList.remove('hidden');el.classList.toggle('error',!!error);
-  clearTimeout(TOAST_TIMEOUT);TOAST_TIMEOUT=setTimeout(()=>el.classList.add('hidden'),error?8500:6500);
+function setSync(ok) {
+  $('#sync-status').innerHTML = `<span class="dot ${ok ? '' : 'off'}"></span>${ok ? 'Live · ' + new Date().toLocaleTimeString('en-IN', {timeStyle: 'short'}) : 'Offline'}`;
 }
-function modal(title,formHtml,kicker='WAREHOUSE ACTION'){
-  $('#modal-title').textContent=title;$('#modal-kicker').textContent=kicker;
-  $('#modal-body').innerHTML=formHtml;$('#modal-overlay').classList.remove('hidden');
-  const first=$('#modal-body input, #modal-body select');if(first)first.focus();
+
+/* ---------------- UI helpers ---------------- */
+function toast(message, error = false) {
+  const el = $('#toast'); el.textContent = message; el.classList.remove('hidden'); el.classList.toggle('error', !!error);
+  clearTimeout(TOAST_TIMEOUT); TOAST_TIMEOUT = setTimeout(() => el.classList.add('hidden'), error ? 8000 : 5000);
 }
-function closeModal(){$('#modal-overlay').classList.add('hidden');$('#modal-body').innerHTML='';}
-function formModal(title,fields,submit,handler,kicker='WAREHOUSE ACTION'){
-  modal(title,`<form id="action-form"><div class="form-grid">${fields}</div>${formButtons(submit)}</form>`,kicker);
-  $('#action-form').addEventListener('submit',async(ev)=>{
-    ev.preventDefault();const btn=$('#action-form [type=submit]');btn.disabled=true;
-    try{let msg=await handler(ev.currentTarget);closeModal();await load();toast(msg||'Saved successfully.');}
-    catch(err){toast(err.message,true);btn.disabled=false;}
+function modal(title, html, kicker = '') {
+  $('#modal-title').textContent = title; $('#modal-kicker').textContent = kicker;
+  $('#modal-body').innerHTML = html; $('#modal-overlay').classList.remove('hidden');
+  const first = $('#modal-body input, #modal-body select'); if (first) first.focus();
+}
+function closeModal() { $('#modal-overlay').classList.add('hidden'); $('#modal-body').innerHTML = ''; }
+function formModal(title, fields, submit, handler, kicker = '') {
+  modal(title, `<form id="action-form"><div class="form-grid">${fields}</div>${formButtons(submit)}</form>`, kicker);
+  $('#action-form').addEventListener('submit', async (ev) => {
+    ev.preventDefault(); const btn = $('#action-form [type=submit]'); btn.disabled = true;
+    try { const msg = await handler(ev.currentTarget); closeModal(); await load(); toast(msg || 'Saved.'); }
+    catch (err) { toast(err.message, true); btn.disabled = false; }
   });
 }
-function panelHead(title,sub='',button=''){return `<div class="section-head"><div><h2>${title}</h2>${sub?`<p class="sub">${sub}</p>`:''}</div>${button}</div>`;}
-function empty(title,sub){return `<div class="empty"><strong>${esc(title)}</strong>${esc(sub)}</div>`;}
+function panelHead(title, sub = '', right = '') { return `<div class="panel-head"><div><h2>${title}</h2>${sub ? `<p>${sub}</p>` : ''}</div>${right}</div>`; }
+function empty(title, sub) { return `<div class="empty"><strong>${esc(title)}</strong>${esc(sub)}</div>`; }
+function levelBar(qty, level) {
+  const pct = level > 0 ? Math.min(100, Math.round(qty / (level * 2) * 100)) : 100;
+  const cls = qty <= level ? 'bad' : qty <= level * 1.5 ? 'warn' : '';
+  return `<div class="bar ${cls}"><span data-pct="${pct}"></span></div>`;
+}
+function paintBars() { $$('.bar span[data-pct]').forEach(s => { s.style.width = s.dataset.pct + '%'; }); }
+function kitStatus(k) {
+  if (k.recipe_pending_reason) return {code: 'locked', label: 'Packing locked', cls: 'warn'};
+  if (!k.recipe_ready) return {code: 'recipe', label: 'Recipe not confirmed', cls: 'warn'};
+  if (k.can_make === 0) return {code: 'short', label: 'Missing parts', cls: 'bad'};
+  return {code: 'ready', label: 'Ready to pack', cls: ''};
+}
+function lowKits() { return DATA.kits.filter(k => k.low_stock); }
+function lowParts() { return DATA.components.filter(c => c.low_stock); }
 
-function render(){
-  const titles={dashboard:['Warehouse overview','Packed stock, component availability and reordering — all in one place.'],kits:['Products & stock','Product catalogue, prices, barcodes, packing batches and physical stock counts.'],components:['Component inventory','Track raw materials, receive stock and configure minimum levels.'],suppliers:['Suppliers & reordering','Compare purchase prices, save product links and track price history.'],activity:['Warehouse activity','An audit trail of packing, handovers and inventory changes.']};
-  $('#page-title').textContent=titles[TAB][0];$('#page-subtitle').textContent=titles[TAB][1];
-  $$('.nav-button').forEach(b=>b.classList.toggle('active',b.dataset.tab===TAB));
-  $('#content').innerHTML=({dashboard:renderDashboard,kits:renderKits,components:renderComponents,suppliers:renderSuppliers,activity:renderActivity})[TAB]();
+/* ---------------- Render ---------------- */
+const PAGES = {
+  dashboard: ['Overview', 'Overview', 'What’s packed, what needs packing, and what to reorder.'],
+  pack: ['Daily work', 'Pack orders', 'Type how many kits you packed for each design. Parts are deducted automatically.'],
+  kits: ['Catalogue', 'Designs', 'Every PBN design, its packed stock, prices and parts recipe.'],
+  components: ['Inventory', 'Parts stock', 'Canvases, strips, brushes, tubes and everything else that goes into a kit.'],
+  reorder: ['Purchasing', 'Reorder links', 'Saved supplier links for every part. Low-stock parts are listed first.'],
+  activity: ['History', 'Activity', 'Every packing, handover and stock change, newest first.'],
+};
+function render() {
+  const [eyebrow, title, sub] = PAGES[TAB];
+  $('#page-eyebrow').textContent = eyebrow; $('#page-title').textContent = title; $('#page-subtitle').textContent = sub;
+  document.title = title + ' · Aurva Warehouse';
+  $$('.nav-button').forEach(b => b.classList.toggle('active', b.dataset.tab === TAB));
+  const parts = lowParts().length;
+  for (const id of ['#count-parts', '#count-reorder']) { const el = $(id); el.textContent = parts; el.classList.toggle('hidden', !parts); }
+  renderDb();
+  $('#content').innerHTML = ({dashboard: renderDashboard, pack: renderPack, kits: renderKits, components: renderComponents, reorder: renderReorder, activity: renderActivity})[TAB]();
+  paintBars();
+  if (TAB === 'pack') updatePackSummary();
 }
-function renderDashboard(){
-  const kitLow=DATA.kits.filter(k=>k.low_stock);
-  const componentLow=DATA.components.filter(c=>c.min_qty>0&&c.qty<=c.min_qty);
-  const total=DATA.kits.reduce((a,k)=>a+k.packed_qty,0);
-  const stat=(label,val,foot,cl='')=>`<div class="stat ${cl}"><div class="label">${label}</div><div class="value">${fmt(val)}</div><div class="footnote">${foot}</div></div>`;
-  let notices=kitLow.length?kitLow.map(k=>`<div class="low-row"><div><div class="name">${esc(k.name)} <span class="mono">${esc(k.size)}</span></div><div class="meta">${fmt(k.packed_qty)} packed · alert at 10</div></div><button class="btn btn-small btn-primary" data-action="pack" data-id="${k.id}">Pack batch +</button></div>`).join(''):empty('All packed-kit levels are above 10','Any kit that reaches 10 or fewer will appear here.');
-  let compNotices=componentLow.length?componentLow.map(c=>{
-      const quotes=DATA.suppliers.filter(s=>s.component_id===c.id).sort((a,b)=>a.price-b.price);
-      return `<div class="low-row"><div><div class="name">${esc(c.name)}</div><div class="meta">${fmt(c.qty)} ${esc(c.unit)} available · minimum ${fmt(c.min_qty)}</div></div><div>${quotes[0]?.url?`<a class="btn btn-small btn-secondary" href="${esc(quotes[0].url)}" target="_blank" rel="noopener noreferrer">Reorder ↗</a>`:`<button class="btn btn-small btn-secondary" data-action="new-supplier" data-component="${c.id}">Add supplier</button>`}</div></div>`;
-  }).join(''):empty('No components below minimum','Set a minimum stock level on the Components page to enable alerts.');
-  return (DATA.kits.some(k=>!k.stock_counted)?'<div class="notice warning"><b>Stocktake pending:</b> newly added products show Not counted until you perform a physical count. They do not trigger low-stock alerts yet.</div>':'')+`<div class="stats">${stat('Packed kits in stock',total,'Counted and recorded kits only','emphasis')}${stat('Product designs / sizes',DATA.kits.length,'Tracked as individual SKUs')}${stat('Pack-new-batch alerts',kitLow.length,'At 10 or fewer packed kits','alert')}${stat('Components to reorder',componentLow.length,'Based on your chosen minimum levels')}</div>
-  <div class="split-grid"><section class="panel">${panelHead('Needs a new packing batch','Automatically flags any SKU with ≤ 10 packed kits',`<button class="btn btn-secondary btn-small" data-tab="kits">View all kits</button>`)}<div class="list-items">${notices}</div></section>
-  <section class="panel">${panelHead('Component alerts','Reorder links appear when available',`<button class="btn btn-secondary btn-small" data-tab="components">Components</button>`)}<div class="list-items">${compNotices}</div></section></div>
-  <div style="height:24px"></div><div class="panel">${panelHead('Recent warehouse activity','Packing, handovers and stock movements')}${activityList(6)}</div>`;
+function renderDb() {
+  const d = DATA.database || {};
+  const where = d.hosted ? 'Railway volume (saved permanently)' : 'This computer';
+  $('#db-card').innerHTML = `<span class="db-title"><span class="dot ${d.hosted && !d.persistent ? 'off' : ''}"></span>${esc(d.engine || 'SQLite')} database</span><span class="mono db-path">${esc(d.path || '')}</span><span class="db-note">${esc(where)}</span>`;
+  $('#footer-db').textContent = `Data stored in ${d.engine || 'SQLite'} · ${d.path || ''}`;
 }
-function kitRow(k){
-  const qty = k.stock_counted ? fmt(k.packed_qty) : 'Not counted';
-  const paintLayout = k.paint_colours == null ? 'Not set'
-    : esc(k.paint_colours) + ' pots · ' + esc(k.full_strips_per_kit) + ' full'
-      + (k.cut_pots_per_kit ? ' + ' + esc(k.cut_pots_per_kit) + '-pot cut' : '');
-  const status = !k.stock_counted ? badge('Awaiting count','wait') : k.low_stock ? badge('Pack new batch','bad') : badge('Healthy');
+
+function renderDashboard() {
+  const kLow = lowKits(), cLow = lowParts();
+  const total = DATA.kits.reduce((a, k) => a + k.packed_qty, 0);
+  const locked = DATA.kits.filter(k => k.recipe_pending_reason || !k.recipe_ready).length;
+  const stat = (label, val, foot, cls = '', tab = '') => `<button class="stat ${cls}" ${tab ? `data-tab="${tab}"` : ''}><div class="label">${label}</div><div class="value">${fmt(val)}</div><div class="foot">${foot}</div></button>`;
+  const kitRows = kLow.length ? kLow.map(k => `<div class="list-row bad"><div><div class="name">${esc(k.name)} <span class="size-tag">${esc(k.size)}</span></div><div class="meta">${k.stock_counted ? plural(k.packed_qty, 'kit') + ' packed' : 'Not counted yet'} · alert at ${DATA.threshold} or fewer</div></div><button class="btn btn-small btn-primary" data-tab="pack">Pack</button></div>`).join('')
+    : empty('All designs are above ' + DATA.threshold, 'Any design with ' + DATA.threshold + ' or fewer packed kits shows up here.');
+  const partRows = cLow.length ? cLow.slice(0, 8).map(c => {
+    const best = linksFor(c.id).find(s => safeUrl(s.url));
+    return `<div class="list-row bad"><div><div class="name">${esc(c.name)}</div><div class="meta">${fmt(c.qty)} ${esc(c.unit)} left · alert at ${fmt(c.alert_level)}</div></div><div class="row-actions">${best ? `<a class="btn btn-small btn-primary" href="${esc(best.url)}" target="_blank" rel="noopener noreferrer">Reorder ↗</a>` : `<button class="btn btn-small btn-secondary" data-action="new-supplier" data-component="${c.id}">Add link</button>`}</div></div>`;
+  }).join('') + (cLow.length > 8 ? `<button class="btn btn-ghost btn-small" data-tab="reorder">See all ${cLow.length} parts →</button>` : '')
+    : empty('Nothing to reorder', 'Parts show here when they get low.');
+  return `${locked ? `<div class="notice warn"><b>${plural(locked, 'design')} can’t be packed yet.</b> Open <b>Pack orders</b> to unlock them, then parts will be deducted automatically.</div>` : ''}
+  <div class="stats">
+    ${stat('Packed kits in stock', total, 'Across all designs', 'dark', 'kits')}
+    ${stat('Designs to pack', kLow.length, DATA.threshold + ' or fewer packed', kLow.length ? 'bad' : '', 'pack')}
+    ${stat('Parts to reorder', cLow.length, 'At or below alert level', cLow.length ? 'bad' : '', 'reorder')}
+    ${stat('Designs', DATA.kits.length, locked ? locked + ' not ready to pack' : 'All ready to pack', locked ? 'warn' : '', 'kits')}
+  </div>
+  <div class="grid-2">
+    <section class="panel">${panelHead('Low stock — designs', 'Pack a new batch for these', `<button class="btn btn-secondary btn-small" data-tab="pack">Pack orders</button>`)}<div class="list">${kitRows}</div></section>
+    <section class="panel">${panelHead('Low stock — parts', 'Reorder these soon', `<button class="btn btn-secondary btn-small" data-tab="reorder">Reorder links</button>`)}<div class="list">${partRows}</div></section>
+  </div>
+  <div class="panel mt">${panelHead('Recent activity', '', `<button class="btn btn-ghost btn-small" data-tab="activity">View all</button>`)}${activityList(6)}</div>`;
+}
+
+/* ---------- Pack orders ---------- */
+function renderPack() {
+  const cards = DATA.kits.map(k => {
+    const st = kitStatus(k);
+    const qty = PACK_QTY[k.id] || '';
+    const canPack = PACK_MODE === 'pack' ? st.code === 'ready' : k.packed_qty > 0;
+    let why = '';
+    if (PACK_MODE === 'pack') {
+      if (st.code === 'locked') why = `<div class="why">Locked: ${esc(k.recipe_pending_reason)}. <button class="btn btn-small btn-warn" data-action="unlock" data-id="${k.id}">Unlock packing</button></div>`;
+      else if (st.code === 'recipe') why = `<div class="why">Recipe not confirmed. <button class="btn btn-small btn-warn" data-action="recipe" data-id="${k.id}">Check recipe</button></div>`;
+      else if (st.code === 'short') why = `<div class="why bad">Out of: ${esc((k.missing.length ? k.missing : ['paint strips']).slice(0, 3).join(', '))}${k.missing.length > 3 ? ` +${k.missing.length - 3} more` : ''}. Receive these in <b>Parts stock</b>.</div>`;
+    } else if (!k.packed_qty) why = `<div class="why">No packed kits to send out.</div>`;
+    return `<article class="pack-card ${qty ? 'has-qty' : ''}" data-kit="${k.id}">
+      <div class="top"><div><h3>${esc(k.name)}</h3><span class="mono">${esc(k.sku)}</span></div><span class="size-tag">${esc(k.size)}</span></div>
+      <div class="facts"><div class="${k.low_stock ? 'bad' : ''}"><b>${k.stock_counted ? fmt(k.packed_qty) : '—'}</b>packed now</div><div><b>${k.can_make == null ? '—' : fmt(k.can_make)}</b>can still make</div><div><b>${k.paint_colours ?? '—'}</b>colours</div></div>
+      ${why}
+      <div class="stepper"><button type="button" data-action="step" data-id="${k.id}" data-step="-1" aria-label="One less" ${canPack ? '' : 'disabled'}>−</button><input type="number" min="0" step="1" inputmode="numeric" class="pack-input" data-id="${k.id}" value="${esc(qty)}" placeholder="0" aria-label="Kits for ${esc(k.name)}" ${canPack ? '' : 'disabled'}><button type="button" data-action="step" data-id="${k.id}" data-step="1" aria-label="One more" ${canPack ? '' : 'disabled'}>+</button></div>
+    </article>`;
+  }).join('');
+  return `<div class="toolbar"><div class="segmented" role="tablist">
+      <button class="${PACK_MODE === 'pack' ? 'on' : ''}" data-action="pack-mode" data-mode="pack">Packed today</button>
+      <button class="${PACK_MODE === 'handover' ? 'on' : ''}" data-action="pack-mode" data-mode="handover">Sent out / handed over</button></div>
+    <span class="muted">${PACK_MODE === 'pack' ? 'Adds to packed stock and deducts every part in the recipe.' : 'Reduces packed stock. Parts were already deducted when packed.'}</span></div>
+  ${DATA.kits.length ? `<div class="pack-grid">${cards}</div>` : empty('No designs yet', 'Add a design on the Designs page.')}
+  <div class="pack-bar"><div class="summary" id="pack-summary"></div><div class="toolbar-actions"><button class="btn btn-small btn-ghost" data-action="pack-clear">Clear</button><button class="btn" data-action="pack-preview" id="pack-go">Review &amp; save</button></div></div>`;
+}
+function packEntries() { return Object.entries(PACK_QTY).map(([id, q]) => [kitById(id), Number(q)]).filter(([k, q]) => k && q > 0); }
+function updatePackSummary() {
+  const entries = packEntries(); const total = entries.reduce((a, [, q]) => a + q, 0);
+  const el = $('#pack-summary'); if (!el) return;
+  el.innerHTML = total ? `<b>${plural(total, 'kit')}</b> across ${plural(entries.length, 'design')}` : 'Enter quantities above';
+  $('#pack-go').disabled = !total;
+  $$('.pack-card').forEach(c => c.classList.toggle('has-qty', Number(PACK_QTY[c.dataset.kit]) > 0));
+}
+function partsNeeded(entries) {
+  const need = new Map();
+  for (const [k, q] of entries) for (const r of k.recipe) need.set(r.component_id, (need.get(r.component_id) || 0) + r.qty_per_kit * q);
+  return need;
+}
+function packPreview() {
+  const entries = packEntries(); if (!entries.length) return;
+  const list = entries.map(([k, q]) => `<div class="usage-row"><span>${esc(k.name)} <span class="mono">${esc(k.size)}</span></span><b>${PACK_MODE === 'pack' ? '+' : '−'}${fmt(q)}</b></div>`).join('');
+  let usage = '';
+  if (PACK_MODE === 'pack') {
+    const need = partsNeeded(entries);
+    const strips = entries.reduce((a, [k, q]) => a + (k.paint_colours ? Math.ceil(k.paint_colours / 6) * q : 0), 0);
+    usage = `<h3 class="eyebrow sub-head">Parts that will be deducted</h3><div class="usage">${[...need].map(([cid, n]) => {
+      const c = compById(cid); const short = c.qty + 1e-8 < n;
+      return `<div class="usage-row ${short ? 'bad' : ''}"><span>${esc(c.name)}</span><span>−${fmt(n)} ${esc(c.unit)} <span class="muted">(have ${fmt(c.qty)})</span></span></div>`;
+    }).join('')}${strips ? `<div class="usage-row"><span>6-pot paint strips (cut automatically)</span><span>about ${fmt(strips)} strips</span></div>` : ''}</div>
+    <p class="muted note">If a part runs short, the app packs as many complete kits as it can and tells you.</p>`;
+  }
+  modal(PACK_MODE === 'pack' ? 'Save packed kits' : 'Save handover', `<div class="usage">${list}</div>${usage}<div class="form-buttons"><button class="btn btn-secondary" data-action="close-modal">Back</button><button class="btn btn-primary" data-action="pack-save">${PACK_MODE === 'pack' ? 'Pack & deduct parts' : 'Record handover'}</button></div>`, PACK_MODE === 'pack' ? 'Review' : 'Review');
+}
+async function packSave(btn) {
+  btn.disabled = true;
+  const entries = packEntries();
+  try {
+    let lines = [];
+    if (PACK_MODE === 'pack') {
+      const r = await request('/api/pack-batch', {items: entries.map(([k, q]) => ({kit_id: k.id, quantity: q}))});
+      lines = r.results.map(x => { const k = kitById(x.kit_id); return x.error ? `${k.name}: not packed — ${x.error}` : `${k.name}: packed ${x.packed}${x.limited ? ` of ${x.requested} (parts ran short)` : ''}`; });
+    } else {
+      for (const [k, q] of entries) {
+        try { const r = await request(`/api/kits/${k.id}/handover`, {quantity: q}); lines.push(`${k.name}: −${q}, ${r.balance} left`); }
+        catch (e) { lines.push(`${k.name}: ${e.message}`); }
+      }
+    }
+    PACK_QTY = {};
+    await load();
+    modal('Saved', `<div class="usage">${lines.map(l => `<div class="usage-row ${/not packed|short|Only/.test(l) ? 'bad' : ''}"><span>${esc(l)}</span></div>`).join('')}</div><div class="form-buttons"><button class="btn btn-primary" data-action="close-modal">Done</button></div>`, 'Result');
+  } catch (e) { toast(e.message, true); btn.disabled = false; }
+}
+function unlockKit(k) {
+  modal('Unlock packing · ' + k.name, `<div class="notice warn">${esc(k.recipe_pending_reason)}.</div>
+    <p>Unlocking lets you pack this design now. Every other part in its recipe is deducted automatically. <b>Adhesive won’t be deducted</b> until you add it to the recipe.</p>
+    <div class="form-buttons"><button class="btn btn-secondary" data-action="recipe" data-id="${k.id}">See recipe</button><button class="btn btn-primary" data-action="unlock-confirm" data-id="${k.id}">Unlock packing</button></div>`, 'Recipe');
+}
+
+/* ---------- Designs ---------- */
+function kitRow(k) {
+  const st = kitStatus(k);
+  const qty = k.stock_counted ? fmt(k.packed_qty) : '<span class="muted">Not counted</span>';
+  const paint = k.paint_colours == null ? '—' : `${k.paint_colours} pots<span class="row-sub">${k.full_strips_per_kit} full strip${k.full_strips_per_kit === 1 ? '' : 's'}${k.cut_pots_per_kit ? ' + ' + k.cut_pots_per_kit + '-pot cut' : ''}</span>`;
   const priced = n => n == null ? '—' : money(n);
-  return '<tr><td><span class="row-title">'+esc(k.name)+'</span>'
-    +(k.subtitle?'<span class="row-sub">'+esc(k.subtitle)+'</span>':'')
-    +'<span class="row-sub mono">'+esc(k.sku)+'</span></td>'
-    +'<td>'+esc(k.size)+'</td>'
-    +'<td>'+paintLayout+'</td>'
-    +'<td class="mono">'+esc(k.barcode||'—')+'</td>'
-    +'<td class="number">'+priced(k.mrp)+'</td>'
-    +'<td class="number">'+priced(k.selling_price)+'</td>'
-    +'<td class="number">'+qty+'</td>'
-    +'<td>'+status+'</td>'
-    +'<td>'+(k.recipe_pending_reason?badge('Adhesive pending','wait'):k.recipe_ready?badge('Ready'):badge('Recipe needed','wait'))+'</td>'
-    +'<td class="actions">'
-    +'<button class="btn btn-small btn-secondary" data-action="edit-kit" data-id="'+k.id+'">Edit details</button>'
-    +'<button class="btn btn-small btn-primary" data-action="pack" data-id="'+k.id+'">+ Pack</button>'
-    +'<button class="btn btn-small btn-secondary" data-action="handover" data-id="'+k.id+'">− Hand over</button>'
-    +'<button class="btn btn-small btn-secondary" data-action="recipe" data-id="'+k.id+'">Recipe</button>'
-    +(!k.recipe_ready && !k.recipe_pending_reason && k.recipe.length?'<button class="btn btn-small btn-tinted" data-action="confirm-recipe" data-id="'+k.id+'">Confirm recipe</button>':'')
-    +'<button class="btn btn-small btn-secondary" data-action="count-kit" data-id="'+k.id+'">Count</button></td></tr>';
+  return `<tr><td><span class="row-title">${esc(k.name)}</span>${k.subtitle ? `<span class="row-sub">${esc(k.subtitle)}</span>` : ''}<span class="mono">${esc(k.sku)}</span></td>
+    <td><span class="size-tag">${esc(k.size)}</span></td><td>${paint}</td>
+    <td class="num">${priced(k.selling_price)}${k.mrp != null && k.mrp !== k.selling_price ? `<span class="row-sub">MRP ${money(k.mrp)}</span>` : ''}</td>
+    <td class="num ${k.low_stock ? 'qty-bad' : 'qty-ok'}">${qty}</td>
+    <td>${k.low_stock ? pill('Low stock', 'bad') : pill('In stock')}</td>
+    <td>${pill(st.label, st.cls)}</td>
+    <td class="actions"><button class="btn btn-small btn-secondary" data-action="recipe" data-id="${k.id}">Recipe</button>${st.code === 'locked' ? `<button class="btn btn-small btn-warn" data-action="unlock" data-id="${k.id}">Unlock</button>` : ''}${st.code === 'recipe' && k.recipe.length ? `<button class="btn btn-small btn-warn" data-action="confirm-recipe" data-id="${k.id}">Confirm recipe</button>` : ''}<button class="btn btn-small btn-secondary" data-action="count-kit" data-id="${k.id}">Count</button><button class="btn btn-small btn-ghost" data-action="edit-kit" data-id="${k.id}">Edit</button></td></tr>`;
 }
-function renderKits(){
-  const kits = DATA.kits.filter(k => [k.name,k.subtitle,k.sku,k.barcode,k.size].join(' ').toLowerCase().includes(SEARCH.toLowerCase()));
-  const rows = kits.map(kitRow).join('');
-  return '<div class="toolbar"><input class="input search" id="list-search" placeholder="Search name, barcode or SKU…" value="'+esc(SEARCH)+'" aria-label="Search products">'
-    +'<div class="toolbar-actions"><button class="btn btn-primary" data-action="new-kit">+ Add PBN kit</button></div></div>'
-    +'<div class="notice"><b>Active catalogue:</b> 9 A3/A4 variants with recorded SKUs, EAN-13 barcodes, MRPs and selling prices. Enter the paint pots per design to calculate full six-pot strips and cut sections, with leftovers reusable in future kits. '
-    +'Packed stock remains <b>Not counted</b> until you complete the physical stocktake. '
-    +'Six A5 phase-out variants and their raw materials will be recorded separately later.</div>'
-    +'<section class="panel">'+panelHead('PBN product catalogue',fmt(DATA.kits.length)+' registered SKUs · '+fmt(DATA.kits.filter(k=>!k.stock_counted).length)+' awaiting stock count')
-    +'<div class="table-scroll"><table style="min-width:1150px"><thead><tr>'
-    +'<th>Artwork / SKU</th><th>Size</th><th>Paint pots / strip layout</th><th>Barcode</th><th class="number">MRP</th><th class="number">Selling price</th>'
-    +'<th class="number">Packed stock</th><th>Stock status</th><th>Component recipe</th><th class="actions">Actions</th></tr></thead>'
-    +'<tbody>'+rows+'</tbody></table></div></section>';
+function renderKits() {
+  const kits = DATA.kits.filter(k => [k.name, k.subtitle, k.sku, k.barcode, k.size].join(' ').toLowerCase().includes(SEARCH.toLowerCase()));
+  return `<div class="toolbar"><input class="input search" id="list-search" placeholder="Search name, SKU or barcode" value="${esc(SEARCH)}" aria-label="Search designs"><div class="toolbar-actions"><button class="btn btn-primary" data-action="new-kit">+ Add design</button></div></div>
+  <section class="panel">${panelHead('All designs', `${plural(DATA.kits.length, 'design')} · low-stock alert at ${DATA.threshold} or fewer packed kits`)}
+  ${kits.length ? `<div class="table-scroll"><table><thead><tr><th>Design</th><th>Size</th><th>Paint</th><th class="num">Price</th><th class="num">Packed</th><th>Stock</th><th>Packing</th><th class="actions"></th></tr></thead><tbody>${kits.map(kitRow).join('')}</tbody></table></div>` : empty('No matches', 'Try a different search.')}</section>`;
 }
-function componentRow(c){
-  const low=c.min_qty>0&&c.qty<=c.min_qty;
-  const quotes=DATA.suppliers.filter(s=>s.component_id===c.id).sort((a,b)=>a.price-b.price);
-  return `<tr><td><div class="row-title">${esc(c.name)}</div><span class="row-sub mono">${esc(c.code)}</span></td><td class="number ${low?'qty-low':''}">${fmt(c.qty)} <span class="muted">${esc(c.unit)}</span></td><td class="number">${fmt(c.min_qty)}</td><td>${low?badge('Low stock','bad'):c.min_qty===0?badge('No alert set','wait'):badge('In stock')}</td><td>${quotes.length?`<span class="row-title">${money(quotes[0].price)}/${esc(c.unit)}</span>`:'<span class="muted">—</span>'}</td><td class="actions"><button class="btn btn-small btn-primary" data-action="receive" data-id="${c.id}">+ Receive</button><button class="btn btn-small btn-secondary" data-action="edit-component" data-id="${c.id}">Edit</button><button class="btn btn-small btn-secondary" data-action="count-component" data-id="${c.id}">Count</button></td></tr>`;
-}
-function renderComponents(){
-  let comps=DATA.components.filter(c=>`${c.name} ${c.code}`.toLowerCase().includes(SEARCH.toLowerCase()));
-  return `<div class="toolbar"><input class="input search" id="list-search" placeholder="Search components…" value="${esc(SEARCH)}" aria-label="Search components"><div class="toolbar-actions"><button class="btn btn-secondary" data-action="convert">⇄ Convert / split stock</button><button class="btn btn-primary" data-action="new-component">+ Add component</button></div></div>
-  <div class="notice">Master-recipe components include design-specific canvases, culture brochures, labels, tubes and brush sets. Newly added components start at <b>zero stock</b> until your physical stocktake. Paint strips are calculated separately; liquid paint and adhesive consumption remain deferred/pending.</div>
-  <section class="panel">${panelHead('Raw materials & packing parts',`${comps.length} components shown`)}<div class="table-scroll"><table><thead><tr><th>Component</th><th class="number">Available</th><th class="number">Min. level</th><th>Status</th><th>Best listed price</th><th class="actions">Actions</th></tr></thead><tbody>${comps.map(componentRow).join('')}</tbody></table></div></section>`;
-}
-function renderSuppliers(){
-  const quotes=DATA.suppliers.filter(s=>{
-    const c=compById(s.component_id);return `${s.name} ${c?.name||''} ${c?.code||''}`.toLowerCase().includes(SEARCH.toLowerCase());
-  });
-  return `<div class="toolbar"><input class="input search" id="list-search" placeholder="Search suppliers or components…" value="${esc(SEARCH)}" aria-label="Search suppliers"><div class="toolbar-actions"><button class="btn btn-primary" data-action="new-supplier">+ Add supplier link</button></div></div>
-  <div class="notice"><b>Price comparisons use purchase price per component only.</b> This first version lets you enter and update quotes, opens supplier links, and keeps price history. Automated weekly website price-checking is not yet included.</div>
-  <section class="panel">${panelHead('Suppliers & purchase links',`${quotes.length} supplier entries`)}${quotes.length?`<div class="table-scroll"><table><thead><tr><th>Component</th><th>Supplier</th><th class="number">Price / component unit</th><th>Reorder</th><th class="actions">Edit</th></tr></thead><tbody>${quotes.map(s=>{let c=compById(s.component_id);let others=DATA.suppliers.filter(q=>q.component_id===s.component_id);return `<tr><td><span class="row-title">${esc(c?.name||'')}</span><span class="row-sub mono">${esc(c?.code||'')}</span></td><td>${esc(s.name)} ${others.length>1&&s.price===Math.min(...others.map(q=>q.price))?badge('Lowest'):''}</td><td class="number"><b>${money(s.price)}</b><span class="muted">/${esc(c?.unit||'unit')}</span></td><td>${s.url?`<a class="btn btn-secondary btn-small url" href="${esc(s.url)}" target="_blank" rel="noopener noreferrer">Open product ↗</a>`:'<span class="muted">No link</span>'}</td><td class="actions"><button class="btn btn-small btn-secondary" data-action="edit-supplier" data-id="${s.id}">Edit</button><button class="btn btn-small btn-secondary" data-action="price-history" data-id="${s.id}">History</button></td></tr>`}).join('')}</tbody></table></div>`:empty('No supplier entries yet','Save a supplier name, purchase price and reordering link for any component.')}</section>`;
-}
-function activityList(limit=80){
-  const rows=DATA.activity.slice(0,limit);
-  return rows.length?`<div>${rows.map(a=>`<div class="activity-row"><div><div class="title">${esc(a.category)}</div><div class="description">${esc(a.description)}</div></div><time>${esc(new Date(a.occurred_at).toLocaleString('en-IN',{dateStyle:'medium',timeStyle:'short'}))}</time></div>`).join('')}</div>`:empty('No activity recorded','Your first stock entry or kit creation will appear here.');
-}
-function renderActivity(){return `<div class="panel">${panelHead('Inventory change history','Shows the most recent 80 changes')}${activityList()}</div>`;}
 
-function newKit(){
-  formModal('Add a PBN kit',
-    input('Internal SKU','sku','text','e.g. PNFA3-91-0004','', 'required')
-    +input('Artwork name','name','text','Product name','', 'required')
-    +input('Product subtitle','subtitle','text','Optional')
-    +input('Paint colours / pots per kit','paint_colours','number','Leave blank until confirmed','','min="1" max="240" step="1"')
-    +selector('Canvas size','size',['A5','A4','A3'].map(x=>({value:x,label:x})),'A4')
-    +input('Barcode (preserve leading zero)','barcode','text','EAN-13-…')
-    +input('MRP (₹)','mrp','number','Optional','','min="0.01" step="any"')
-    +input('Regular selling price (₹)','selling_price','number','Optional','','min="0.01" step="any"')
-    +input('Opening packed stock — optional','packed_qty','number','Leave blank until physical count','','min="0" step="1"')
-    +'<div class="wide notice"><b>Leave stock blank</b> until counted. This will show Not counted rather than zero.</div>',
-    'Create kit',async form=>{await request('/api/kits',Object.fromEntries(new FormData(form)));return 'Product created. Stock can be counted later.';},'PRODUCT CATALOGUE');
+/* ---------- Parts ---------- */
+function componentRow(c) {
+  return `<tr><td><span class="row-title">${esc(c.name)}</span><span class="mono">${esc(c.code)}</span></td>
+    <td><div class="level"><div class="level-top"><b class="${c.low_stock ? 'qty-bad' : ''}">${fmt(c.qty)} ${esc(c.unit)}</b><span class="muted">${c.alert_rule === 'none' ? 'no alert' : 'alert ≤ ' + fmt(c.alert_level)}</span></div>${c.alert_rule === 'none' ? '' : levelBar(c.qty, c.alert_level)}</div></td>
+    <td>${c.low_stock ? pill('Reorder', 'bad') : c.alert_rule === 'none' ? pill('No alert', 'neutral') : pill('OK')}</td>
+    <td class="num">${c.used_in ? plural(c.used_in, 'design') : '<span class="muted">—</span>'}</td>
+    <td class="actions"><button class="btn btn-small btn-primary" data-action="receive" data-id="${c.id}">+ Receive</button><button class="btn btn-small btn-secondary" data-action="count-component" data-id="${c.id}">Count</button><button class="btn btn-small btn-ghost" data-action="edit-component" data-id="${c.id}">Edit</button></td></tr>`;
 }
-function editKit(k){
-  formModal('Edit product · '+k.sku,
-    input('Artwork name','name','text','',k.name,'required')
-    +input('Product subtitle','subtitle','text','',k.subtitle||'')
-    +input('Paint colours / pots per kit','paint_colours','number','Leave blank until confirmed',k.paint_colours==null?'':k.paint_colours,'min="1" max="240" step="1"')
-    +input('Barcode (preserve leading zeros)','barcode','text','EAN-13-…',k.barcode||'')
-    +input('MRP (₹)','mrp','number','Optional',k.mrp==null?'':k.mrp,'min="0.01" step="any"')
-    +input('Regular selling price (₹)','selling_price','number','Optional',k.selling_price==null?'':k.selling_price,'min="0.01" step="any"')
-    +'<div class="wide notice"><b>SKU '+esc(k.sku)+' · '+esc(k.size)+'</b>. One connected strip holds 6 pots. For 15 pots, pack 2 full strips + one 3-pot cut section; the other 3-pot section remains available. The app tracks reusable cut pieces, and no stock is deducted until kits are packed. Changing the count requires recipe confirmation again.</div>',
-    'Save product details',async form=>{await request('/api/kits/'+k.id+'/update',Object.fromEntries(new FormData(form)));return 'Product details updated.';},'EDIT PRODUCT');
+function renderComponents() {
+  const comps = DATA.components.filter(c => `${c.name} ${c.code}`.toLowerCase().includes(SEARCH.toLowerCase()))
+    .sort((a, b) => (b.low_stock - a.low_stock) || a.name.localeCompare(b.name));
+  return `<div class="toolbar"><input class="input search" id="list-search" placeholder="Search parts" value="${esc(SEARCH)}" aria-label="Search parts"><div class="toolbar-actions"><button class="btn btn-secondary" data-action="convert">Split stock</button><button class="btn btn-primary" data-action="new-component">+ Add part</button></div></div>
+  <div class="notice">Parts alert when there’s only enough left for <b>${DATA.threshold} kits</b> (e.g. 20 hooks, 500 cm cord). Set your own minimum for any part with <b>Edit</b>.</div>
+  <section class="panel">${panelHead('All parts', `${plural(comps.length, 'part')} · ${lowParts().length} need reordering`)}
+  <div class="table-scroll"><table><thead><tr><th>Part</th><th>In stock</th><th>Status</th><th class="num">Used in</th><th class="actions"></th></tr></thead><tbody>${comps.map(componentRow).join('')}</tbody></table></div></section>`;
 }
-function newComponent(){
-  formModal('Add a component',input('Component code','code','text','e.g. CANVAS-READ-A4','', 'required')+input('Component name','name','text','e.g. Reading Nook printed canvas A4','', 'required')+selector('Stock tracking unit','unit',['pcs','set','strip','tube','cm','ml','g'].map(x=>({value:x,label:x})),'pcs')+input('Opening stock in component units','qty','number','0','0','min="0" step="any" required')+input('Minimum stock warning level','min_qty','number','0','0','min="0" step="any" required')+input('Units added per purchase unit','purchase_multiplier','number','1','1','min="0.0001" step="any" required')+input('Purchase unit label','purchase_unit','text','e.g. sheet / bottle / unit','unit','required')+
-  `<div class="wide notice">Example: for 6 hanging instructions printed on one A4 sheet, set <b>units per purchase = 6</b> and purchase unit = <b>A4 sheet</b>.</div>`, 'Add component',async form=>{await request('/api/components',Object.fromEntries(new FormData(form)));return 'Component created.';},'NEW INVENTORY COMPONENT');
+
+/* ---------- Reorder links ---------- */
+function renderReorder() {
+  let comps = DATA.components.filter(c => c.alert_rule !== 'none' || linksFor(c.id).length);
+  if (REORDER_FILTER === 'low') comps = comps.filter(c => c.low_stock);
+  if (REORDER_FILTER === 'links') comps = comps.filter(c => linksFor(c.id).length);
+  if (SEARCH) comps = comps.filter(c => `${c.name} ${c.code} ${linksFor(c.id).map(s => s.name).join(' ')}`.toLowerCase().includes(SEARCH.toLowerCase()));
+  comps.sort((a, b) => (b.low_stock - a.low_stock) || a.name.localeCompare(b.name));
+  const rows = comps.map(c => {
+    const links = linksFor(c.id);
+    const chips = links.map((s, i) => `<span class="link-chip"><span>${esc(s.name)} · <b>${money(s.price)}</b>/${esc(c.unit)}${i === 0 && links.length > 1 ? ' ' + pill('Cheapest') : ''}</span>${safeUrl(s.url) ? `<a class="btn btn-small btn-primary" href="${esc(s.url)}" target="_blank" rel="noopener noreferrer">Reorder ↗</a>` : '<span class="muted">no link</span>'}<button class="icon-button" title="Edit link" aria-label="Edit ${esc(s.name)}" data-action="edit-supplier" data-id="${s.id}">✎</button></span>`).join('');
+    return `<tr><td><span class="row-title">${esc(c.name)}</span><span class="mono">${esc(c.code)}</span></td>
+      <td><div class="level"><div class="level-top"><b class="${c.low_stock ? 'qty-bad' : ''}">${fmt(c.qty)} ${esc(c.unit)}</b><span class="muted">alert ≤ ${fmt(c.alert_level)}</span></div>${levelBar(c.qty, c.alert_level)}</div></td>
+      <td><div class="links">${chips}<button class="btn btn-small btn-secondary" data-action="new-supplier" data-component="${c.id}">+ Link</button></div></td></tr>`;
+  }).join('');
+  const f = (key, label) => `<button class="${REORDER_FILTER === key ? 'on' : ''}" data-action="reorder-filter" data-filter="${key}">${label}</button>`;
+  return `<div class="toolbar"><div class="segmented">${f('low', `Needs reorder (${lowParts().length})`)}${f('links', 'Has a link')}${f('all', 'All parts')}</div><div class="toolbar-actions"><input class="input search" id="list-search" placeholder="Search parts or suppliers" value="${esc(SEARCH)}" aria-label="Search"><button class="btn btn-primary" data-action="new-supplier">+ Add link</button></div></div>
+  <section class="panel">${comps.length ? `<div class="table-scroll"><table><thead><tr><th>Part</th><th>Stock</th><th class="actions">Supplier links</th></tr></thead><tbody>${rows}</tbody></table></div>` : empty(REORDER_FILTER === 'low' ? 'Nothing needs reordering' : 'No parts here yet', REORDER_FILTER === 'low' ? 'All parts are above their alert level.' : 'Add a supplier link to any part.')}</section>`;
 }
-function editComponent(c){
-  formModal('Edit '+c.name,input('Component name','name','text','',c.name,'required')+input('Minimum stock warning level','min_qty','number','',''+c.min_qty,'min="0" step="any" required')+input('Units added per purchase unit','purchase_multiplier','number','',c.purchase_multiplier,'min="0.0001" step="any" required')+input('Purchase unit label','purchase_unit','text','',c.purchase_unit,'required')+`<div class="wide notice">Tracking code: <b>${esc(c.code)}</b>. Unit: <b>${esc(c.unit)}</b>. These stay fixed to protect kit recipes.</div>`, 'Save settings',async form=>{await request(`/api/components/${c.id}/update`,Object.fromEntries(new FormData(form)));return 'Component settings saved.';});
+
+/* ---------- Activity ---------- */
+function activityList(limit = 80) {
+  const rows = DATA.activity.slice(0, limit);
+  return rows.length ? `<div>${rows.map(a => `<div class="activity-row"><div><div class="title">${esc(a.category)}</div><div class="description">${esc(a.description)}</div></div><time>${esc(new Date(a.occurred_at).toLocaleString('en-IN', {dateStyle: 'medium', timeStyle: 'short'}))}</time></div>`).join('')}</div>` : empty('No activity yet', 'Your first packing or stock change will appear here.');
 }
-function receiveComponent(c){
-  formModal('Receive '+c.name,input(`How many ${c.purchase_unit}(s) arrived?`,'amount','number','Enter received amount','','min="0.0001" step="any" required')+`<div class="wide notice">Each ${esc(c.purchase_unit)} adds <b>${fmt(c.purchase_multiplier)} ${esc(c.unit)}</b> to stock. Current stock: <b>${fmt(c.qty)} ${esc(c.unit)}</b>.</div>`,'Add received stock',async form=>{let r=await request(`/api/components/${c.id}/receive`,{amount:fval(form,'amount')});return `Added ${fmt(r.received)} ${r.unit} to component stock.`;},'RECEIVE PURCHASED STOCK');
+function renderActivity() { return `<div class="panel">${panelHead('Latest changes', 'Most recent 80 entries')}${activityList()}</div>`; }
+
+/* ---------------- Forms ---------------- */
+function newKit() {
+  formModal('Add a design',
+    input('SKU', 'sku', 'text', 'e.g. PNFA3-91-0004', '', 'required')
+    + input('Design name', 'name', 'text', 'Artwork name', '', 'required')
+    + input('Subtitle', 'subtitle', 'text', 'Optional')
+    + selector('Canvas size', 'size', ['A5', 'A4', 'A3'].map(x => ({value: x, label: x})), 'A4')
+    + input('Paint colours per kit', 'paint_colours', 'number', 'e.g. 12', '', 'min="1" max="240" step="1"')
+    + input('Barcode', 'barcode', 'text', 'EAN-13-…')
+    + input('MRP (₹)', 'mrp', 'number', 'Optional', '', 'min="0.01" step="any"')
+    + input('Selling price (₹)', 'selling_price', 'number', 'Optional', '', 'min="0.01" step="any"')
+    + input('Packed kits right now', 'packed_qty', 'number', 'Leave blank if not counted', '', 'min="0" step="1"'),
+    'Add design', async form => { await request('/api/kits', Object.fromEntries(new FormData(form))); return 'Design added. Set up its recipe next.'; }, 'Designs');
 }
-function countComponent(c){
-  formModal('Correct component stock',input(`Counted quantity (${c.unit})`,'qty','number','',c.qty,'min="0" step="any" required')+`<div class="wide notice">Use this when physically counting stock. The correction is recorded in the Activity tab.</div>`,'Save physical count',async form=>{await request(`/api/components/${c.id}/count`,{qty:fval(form,'qty')});return 'Component stock count updated.';},'STOCKTAKE');
+function editKit(k) {
+  formModal('Edit · ' + k.name,
+    input('Design name', 'name', 'text', '', k.name, 'required')
+    + input('Subtitle', 'subtitle', 'text', '', k.subtitle || '')
+    + input('Paint colours per kit', 'paint_colours', 'number', '', k.paint_colours ?? '', 'min="1" max="240" step="1"')
+    + input('Barcode', 'barcode', 'text', 'EAN-13-…', k.barcode || '')
+    + input('MRP (₹)', 'mrp', 'number', 'Optional', k.mrp ?? '', 'min="0.01" step="any"')
+    + input('Selling price (₹)', 'selling_price', 'number', 'Optional', k.selling_price ?? '', 'min="0.01" step="any"')
+    + `<div class="wide notice">SKU <b>${esc(k.sku)}</b> · ${esc(k.size)}. Changing the colour count means the recipe must be confirmed again.</div>`,
+    'Save', async form => { await request('/api/kits/' + k.id + '/update', Object.fromEntries(new FormData(form))); return 'Design updated.'; }, 'Designs');
 }
-function countKit(k){
-  formModal('Correct packed stock',input('Physically counted packed kits','quantity','number','',k.packed_qty,'min="0" step="1" required')+`<div class="wide notice">This corrects the packed quantity for ${esc(k.sku)} without changing raw component stock. Use only for physical stock count corrections.</div>`,'Save physical count',async form=>{await request(`/api/kits/${k.id}/count`,{quantity:fval(form,'quantity')});return 'Packed stock count updated.';},'STOCKTAKE');
+function newComponent() {
+  formModal('Add a part',
+    input('Code', 'code', 'text', 'e.g. CANVAS-READ-A4', '', 'required')
+    + input('Name', 'name', 'text', 'e.g. Reading Nook canvas A4', '', 'required')
+    + selector('Counted in', 'unit', ['pcs', 'set', 'strip', 'tube', 'cm', 'ml', 'g'].map(x => ({value: x, label: x})), 'pcs')
+    + input('In stock now', 'qty', 'number', '0', '0', 'min="0" step="any" required')
+    + input('Alert when at or below', 'min_qty', 'number', '0 = automatic (10 kits’ worth)', '0', 'min="0" step="any" required')
+    + input('Units per purchase', 'purchase_multiplier', 'number', '1', '1', 'min="0.0001" step="any" required')
+    + input('Purchase unit name', 'purchase_unit', 'text', 'e.g. sheet / pack', 'unit', 'required')
+    + `<div class="wide notice">Example: 6 hanging instructions print on one A4 sheet → units per purchase <b>6</b>, purchase unit <b>A4 sheet</b>.</div>`,
+    'Add part', async form => { await request('/api/components', Object.fromEntries(new FormData(form))); return 'Part added.'; }, 'Parts');
 }
-function packKit(k){
-  let possible=k.can_make==null?'Confirm this SKU’s component recipe first.':`${fmt(k.can_make)} complete kits possible with currently available components (per this recipe).`;
-  formModal('Pack new batch · '+k.name,input('How many fully packed kits?','quantity','number','e.g. 20','','min="1" step="1" required')+`<div class="wide notice"><b>${esc(k.sku)}</b> · ${esc(k.size)}<br/>${esc(possible)}<br/>If ingredients are insufficient, the app packs only the maximum possible complete kits. Every packed kit deducts the ordinary recipe once, plus the calculated paint-strip sections; reusable leftovers remain in stock.</div>`,'Record packed batch',async form=>{let r=await request(`/api/kits/${k.id}/pack`,{quantity:fval(form,'quantity')});return r.limited?`Packed ${r.packed} of ${r.requested} requested kits; limited by component stock.`:`Added ${r.packed} packed kits. Components deducted.`;},'PACKED STOCK INCREASE');
+function editComponent(c) {
+  formModal('Edit · ' + c.name,
+    input('Name', 'name', 'text', '', c.name, 'required')
+    + input('Alert when at or below', 'min_qty', 'number', '0 = automatic', '' + c.min_qty, 'min="0" step="any" required')
+    + input('Units per purchase', 'purchase_multiplier', 'number', '', c.purchase_multiplier, 'min="0.0001" step="any" required')
+    + input('Purchase unit name', 'purchase_unit', 'text', '', c.purchase_unit, 'required')
+    + `<div class="wide notice">Code <b>${esc(c.code)}</b> · counted in <b>${esc(c.unit)}</b>. Set the alert to <b>0</b> to use the automatic level (${fmt(c.alert_rule === 'custom' ? c.alert_level : c.alert_level)} now).</div>`,
+    'Save', async form => { await request(`/api/components/${c.id}/update`, Object.fromEntries(new FormData(form))); return 'Part updated.'; }, 'Parts');
 }
-function handoverKit(k){
-  formModal('Hand over packed kits · '+k.name,input('How many packed kits handed over?','quantity','number','e.g. 5','','min="1" step="1" required')+`<div class="wide notice">Current packed stock: <b>${fmt(k.packed_qty)}</b> kits. Handovers reduce packed stock but do not deduct components again. <b>No Shopify connection.</b></div>`,'Record handover',async form=>{let r=await request(`/api/kits/${k.id}/handover`,{quantity:fval(form,'quantity')});return `Handover recorded. ${r.balance} packed kits remain.${r.balance<=10?' Pack-new-batch alert is active.':''}`;},'HANDOVER TO SALES TEAM');
+function receiveComponent(c) {
+  formModal('Receive · ' + c.name,
+    input(`How many ${c.purchase_unit}(s) arrived?`, 'amount', 'number', '', '', 'min="0.0001" step="any" required')
+    + `<div class="wide notice">Each ${esc(c.purchase_unit)} adds <b>${fmt(c.purchase_multiplier)} ${esc(c.unit)}</b>. In stock now: <b>${fmt(c.qty)} ${esc(c.unit)}</b>.</div>`,
+    'Add to stock', async form => { const r = await request(`/api/components/${c.id}/receive`, {amount: fval(form, 'amount')}); return `Added ${fmt(r.received)} ${r.unit}.`; }, 'Receive stock');
 }
-function recipeRow(cid='',qty=''){
- return `<div class="recipe-row"><div class="field"><select class="select recipe-component">${optionComp(cid)}</select></div><div class="field"><input class="input recipe-qty" type="number" min="0.0001" step="any" placeholder="Qty / kit" value="${esc(qty)}"></div><button class="icon-button" type="button" title="Remove row" data-action="remove-recipe-row">✕</button></div>`;
+function countComponent(c) {
+  formModal('Count · ' + c.name, input(`Counted quantity (${c.unit})`, 'qty', 'number', '', c.qty, 'min="0" step="any" required')
+    + `<div class="wide notice">Use after a physical count. The change is logged in Activity.</div>`,
+    'Save count', async form => { await request(`/api/components/${c.id}/count`, {qty: fval(form, 'qty')}); return 'Stock count saved.'; }, 'Stocktake');
 }
-function editRecipe(k){
-  const rows=k.recipe.map(r=>recipeRow(r.component_id,r.qty_per_kit)).join('')||recipeRow();
-  modal('Kit component recipe · '+k.sku,`<div class="notice warning">${k.recipe_pending_reason?'<b>Recipe saved, but packing is locked:</b> '+esc(k.recipe_pending_reason)+'. ':''}The saved master recipe includes a design-specific canvas, brochure and label, along with both rods, a 2-brush set, one hook packet’s separate contents, and a correctly sized tube. The empty paint-strip requirement is calculated automatically, with reusable offcuts. Paint fill is ${k.paint_fill_ml??'unconfirmed'} mL per pot (reference only; liquid paint inventory is deferred). Adhesive consumption is not deducted until measured. Saving changes requires recipe confirmation again.</div><form id="recipe-form"><div class="recipe-actions"><span class="field"><label>Component</label></span><span class="field"><label>Qty per packed kit</label></span></div><div id="recipe-rows">${rows}</div><div class="recipe-actions"><button class="btn btn-secondary btn-small" data-action="add-recipe-row" type="button">+ Add component</button><button class="btn btn-secondary btn-small" data-action="standard-recipe" data-id="${k.id}" type="button">Add known common parts</button></div>${formButtons('Save component recipe')}</form>`, 'BILL OF MATERIALS');
-  $('#recipe-form').addEventListener('submit',async ev=>{
-    ev.preventDefault();let items=$$('.recipe-row',$('#recipe-rows'));
-    const recipe=items.map(row=>({component_id:$('.recipe-component',row).value,qty_per_kit:$('.recipe-qty',row).value})).filter(x=>x.component_id||x.qty_per_kit);
-    try{await request(`/api/kits/${k.id}/recipe`,{items:recipe});closeModal();await load();toast('Recipe saved. Click “Confirm recipe” before packing.');}
-    catch(err){toast(err.message,true);}
+function countKit(k) {
+  formModal('Count packed kits · ' + k.name, input('Packed kits on the shelf', 'quantity', 'number', '', k.packed_qty, 'min="0" step="1" required')
+    + `<div class="wide notice">Corrects packed stock for ${esc(k.sku)} without touching parts.</div>`,
+    'Save count', async form => { await request(`/api/kits/${k.id}/count`, {quantity: fval(form, 'quantity')}); return 'Packed count saved.'; }, 'Stocktake');
+}
+function recipeRow(cid = '', qty = '') {
+  return `<div class="recipe-row"><select class="select recipe-component" aria-label="Part">${optionComp(cid)}</select><input class="input recipe-qty" type="number" min="0.0001" step="any" placeholder="Qty" aria-label="Quantity per kit" value="${esc(qty)}"><button class="icon-button" type="button" title="Remove" data-action="remove-recipe-row">✕</button></div>`;
+}
+function editRecipe(k) {
+  const rows = k.recipe.map(r => recipeRow(r.component_id, r.qty_per_kit)).join('') || recipeRow();
+  modal('Recipe · ' + k.name, `<p class="muted intro">Parts used to pack <b>one</b> kit. Paint strips are worked out automatically from the colour count (${k.paint_colours ?? '?'} pots).</p>
+    ${k.recipe_pending_reason ? `<div class="notice warn">${esc(k.recipe_pending_reason)}. Saving this recipe keeps it locked — use <b>Unlock packing</b> afterwards.</div>` : ''}
+    <form id="recipe-form"><div id="recipe-rows">${rows}</div>
+    <div class="recipe-actions"><button class="btn btn-secondary btn-small" data-action="add-recipe-row" type="button">+ Add part</button><button class="btn btn-ghost btn-small" data-action="standard-recipe" data-id="${k.id}" type="button">Add common parts</button></div>${formButtons('Save recipe')}</form>`, 'Recipe');
+  $('#recipe-form').addEventListener('submit', async ev => {
+    ev.preventDefault();
+    const recipe = $$('.recipe-row', $('#recipe-rows')).map(row => ({component_id: $('.recipe-component', row).value, qty_per_kit: $('.recipe-qty', row).value})).filter(x => x.component_id || x.qty_per_kit);
+    try { await request(`/api/kits/${k.id}/recipe`, {items: recipe}); closeModal(); await load(); toast('Recipe saved. Confirm it to enable packing.'); }
+    catch (err) { toast(err.message, true); }
   });
 }
-function standardParts(k){
-  const known = k.size==='A5' ? [] : [['CORD-CM',50],['HOOK',2],['ZIPLOCK',1],['HANG-INSTRUCT',1],[k.size==='A3'?'TUBE-A3':'TUBE-A4',1],['WOOD-CM',k.size==='A3'?60:42],['BRUSH-2SET',1]];
-  const rows=$$('#recipe-rows .recipe-row');const existing=new Set(rows.map(x=>$('.recipe-component',x).value).filter(Boolean));
-  let added=0;
-  for(const [code,qty] of known){
-    const c=DATA.components.find(x=>x.code===code);if(!c||existing.has(String(c.id)))continue;
-    const blank=rows.find(x=>!$('.recipe-component',x).value);if(blank){$('.recipe-component',blank).value=String(c.id);$('.recipe-qty',blank).value=qty;existing.add(String(c.id));continue;}
-    $('#recipe-rows').insertAdjacentHTML('beforeend',recipeRow(c.id,qty));existing.add(String(c.id));added++;
+function standardParts(k) {
+  const known = k.size === 'A5' ? [] : [['CORD-CM', 50], ['HOOK', 2], ['ZIPLOCK', 1], ['HANG-INSTRUCT', 1], [k.size === 'A3' ? 'TUBE-A3' : 'TUBE-A4', 1], ['WOOD-CM', k.size === 'A3' ? 60 : 42], ['BRUSH-2SET', 1]];
+  const rows = $$('#recipe-rows .recipe-row'); const existing = new Set(rows.map(x => $('.recipe-component', x).value).filter(Boolean));
+  for (const [code, qty] of known) {
+    const c = DATA.components.find(x => x.code === code); if (!c || existing.has(String(c.id))) continue;
+    const blank = rows.find(x => !$('.recipe-component', x).value);
+    if (blank) { $('.recipe-component', blank).value = String(c.id); $('.recipe-qty', blank).value = qty; }
+    else $('#recipe-rows').insertAdjacentHTML('beforeend', recipeRow(c.id, qty));
+    existing.add(String(c.id));
   }
-  toast('Added known common quantities. Complete the artwork-specific items and review wood use before confirming.');
+  toast('Common parts added. Add the design’s canvas, brochure and label too.');
 }
-function splitComponents(){
-  const brushCode=code=>DATA.components.find(c=>c.code===code);
-  const initial=brushCode('BRUSH-SET');const targetCodes=['BRUSH-FINE','BRUSH-MED','BRUSH-BROAD'];
-  const targetRows=targetCodes.map(code=>{let c=brushCode(code);return `<div class="field"><label>${esc(c?.name||'Output component')}</label><select class="select conversion-output">${optionComp(c?.id||'')}</select></div><div class="field"><label>Amount added</label><input class="input conversion-qty" type="number" min="0" step="any" value="1"></div>`;}).join('');
-  formModal('Convert or split stock',selector('Source component','source_component_id',DATA.components.map(c=>({value:c.id,label:`${c.name} (${fmt(c.qty)} ${c.unit} available)`})),initial?.id)+input('Quantity used from source','amount','number','1','1','min="0.0001" step="any" required')+`<div class="wide"><h3>Stock to add after conversion</h3><p class="muted">Example: one 3-brush set becomes 1 fine, 1 medium and 1 broad brush. Change amounts to match the source quantity.</p><div class="form-grid">${targetRows}</div></div>`,'Convert stock',async form=>{
-    const outputSelectors=$$('.conversion-output',form),quantities=$$('.conversion-qty',form);
-    const outputs=outputSelectors.map((sel,i)=>({component_id:sel.value,amount:quantities[i].value})).filter(x=>x.component_id&&Number(x.amount)>0);
-    await request('/api/convert',{source_component_id:fval(form,'source_component_id'),amount:fval(form,'amount'),outputs});return 'Stock conversion recorded.';
-  },'RAW MATERIAL CONVERSION');
+function splitComponents() {
+  const byCode = code => DATA.components.find(c => c.code === code);
+  const initial = byCode('BRUSH-SET');
+  const targets = ['BRUSH-FINE', 'BRUSH-MED', 'BRUSH-BROAD'].map(code => { const c = byCode(code); return `<div class="field"><label>Becomes</label><select class="select conversion-output">${optionComp(c?.id || '')}</select></div><div class="field"><label>Amount</label><input class="input conversion-qty" type="number" min="0" step="any" value="1"></div>`; }).join('');
+  formModal('Split stock', selector('Take from', 'source_component_id', DATA.components.map(c => ({value: c.id, label: `${c.name} (${fmt(c.qty)} ${c.unit})`})), initial?.id)
+    + input('How many', 'amount', 'number', '1', '1', 'min="0.0001" step="any" required')
+    + `<div class="wide"><p class="muted intro">Example: one 3-brush set → 1 fine, 1 medium, 1 broad brush.</p><div class="form-grid">${targets}</div></div>`,
+    'Split', async form => {
+      const outs = $$('.conversion-output', form), qs = $$('.conversion-qty', form);
+      const outputs = outs.map((s, i) => ({component_id: s.value, amount: qs[i].value})).filter(x => x.component_id && Number(x.amount) > 0);
+      await request('/api/convert', {source_component_id: fval(form, 'source_component_id'), amount: fval(form, 'amount'), outputs}); return 'Stock split recorded.';
+    }, 'Parts');
 }
-function addSupplier(componentId=''){
-  if(!DATA.components.length){toast('Create a component first.',true);return;}
-  formModal('Add supplier / reorder link',selector('Component','component_id',DATA.components.map(c=>({value:c.id,label:`${c.name} (${c.unit})`})),componentId||DATA.components[0].id)+input('Supplier name','name','text','Company or vendor name','','required')+input('Product reorder URL (optional)','url','url','https://…')+input('Price per component stock unit (₹)','price','number','e.g. 12.50','','min="0" step="any" required')+`<div class="wide notice">Compare prices using the component's tracking unit (e.g. ₹ per cm, per strip, per piece or per ml). Your price history begins with this first entry.</div>`,'Add supplier',async form=>{await request('/api/suppliers',Object.fromEntries(new FormData(form)));return 'Supplier and reorder link saved.';},'SUPPLIER DIRECTORY');
+function addSupplier(componentId = '') {
+  if (!DATA.components.length) { toast('Add a part first.', true); return; }
+  formModal('Add reorder link', selector('Part', 'component_id', DATA.components.map(c => ({value: c.id, label: `${c.name} (${c.unit})`})), componentId || DATA.components[0].id)
+    + input('Supplier name', 'name', 'text', 'e.g. Amazon, local printer', '', 'required')
+    + input('Product link', 'url', 'url', 'https://…', '', '')
+    + input('Price per unit (₹)', 'price', 'number', 'e.g. 12.50', '', 'min="0" step="any" required')
+    + `<div class="wide notice">Enter the price per counted unit (per piece, per cm, per strip) so suppliers can be compared.</div>`,
+    'Save link', async form => { await request('/api/suppliers', Object.fromEntries(new FormData(form))); return 'Reorder link saved.'; }, 'Reorder links');
 }
-function editSupplier(s){
-  const c=compById(s.component_id);
-  formModal('Update supplier · '+s.name,input('Supplier name','name','text','',s.name,'required')+input('Reorder URL','url','url','https://…',s.url)+input(`Price per ${c?.unit||'unit'} (₹)`,'price','number','',s.price,'min="0" step="any" required')+`<div class="wide notice">Component: <b>${esc(c?.name||'')}</b>. When the price changes, both the old and new prices remain available in price history.</div>`,'Save supplier',async form=>{await request(`/api/suppliers/${s.id}/update`,Object.fromEntries(new FormData(form)));return 'Supplier details saved.';});
+function editSupplier(s) {
+  const c = compById(s.component_id);
+  formModal('Edit link · ' + s.name, input('Supplier name', 'name', 'text', '', s.name, 'required')
+    + input('Product link', 'url', 'url', 'https://…', s.url)
+    + input(`Price per ${c?.unit || 'unit'} (₹)`, 'price', 'number', '', s.price, 'min="0" step="any" required')
+    + `<div class="wide notice">For <b>${esc(c?.name || '')}</b>. Old prices are kept in history. <button type="button" class="btn btn-small btn-ghost" data-action="price-history" data-id="${s.id}">View price history</button></div>`,
+    'Save', async form => { await request(`/api/suppliers/${s.id}/update`, Object.fromEntries(new FormData(form))); return 'Link updated.'; }, 'Reorder links');
 }
-function priceHistory(s){
-  const history=DATA.price_history.filter(p=>p.supplier_id===s.id);
-  modal('Price history · '+s.name,`<p class="muted">Most recent 200 logged supplier price entries are available across the warehouse.</p>${history.length?history.map(h=>`<div class="activity-row"><b>${money(h.price)}</b><time>${esc(new Date(h.changed_at).toLocaleString('en-IN'))}</time></div>`).join(''):empty('No price history','Update a supplier price to create a record.')}<div class="form-buttons"><button class="btn btn-primary" data-action="close-modal">Close</button></div>`,'SUPPLIER PRICE HISTORY');
+function priceHistory(s) {
+  const h = DATA.price_history.filter(p => p.supplier_id === s.id);
+  modal('Price history · ' + s.name, `${h.length ? h.map(x => `<div class="activity-row"><b>${money(x.price)}</b><time>${esc(new Date(x.changed_at).toLocaleString('en-IN'))}</time></div>`).join('') : empty('No history', 'Change the price to start a history.')}<div class="form-buttons"><button class="btn btn-primary" data-action="close-modal">Close</button></div>`, 'Reorder links');
 }
 
-async function runAction(action,id,el){
-  switch(action){
-    case 'refresh':await load();toast('Inventory refreshed.');break;
-    case 'close-modal':closeModal();break;
-    case 'new-kit':newKit();break;
-    case 'edit-kit':editKit(kitById(id));break;
-    case 'new-component':newComponent();break;
-    case 'new-supplier':addSupplier(el.dataset.component||'');break;
-    case 'edit-component':editComponent(compById(id));break;
-    case 'receive':receiveComponent(compById(id));break;
-    case 'count-component':countComponent(compById(id));break;
-    case 'convert':splitComponents();break;
-    case 'pack':packKit(kitById(id));break;
-    case 'handover':handoverKit(kitById(id));break;
-    case 'count-kit':countKit(kitById(id));break;
-    case 'recipe':editRecipe(kitById(id));break;
-    case 'add-recipe-row':$('#recipe-rows').insertAdjacentHTML('beforeend',recipeRow());break;
-    case 'remove-recipe-row':el.closest('.recipe-row')?.remove();break;
-    case 'standard-recipe':standardParts(kitById(id));break;
-    case 'edit-supplier':editSupplier(supplierById(id));break;
-    case 'price-history':priceHistory(supplierById(id));break;
+/* ---------------- Theme ---------------- */
+function applyTheme(t) {
+  if (t) document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme;
+  const dark = t ? t === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+  $('#theme-btn').textContent = dark ? 'Light mode' : 'Dark mode';
+}
+function storedTheme() { try { return localStorage.getItem('aurva-theme'); } catch (e) { return null; } }
+
+/* ---------------- Events ---------------- */
+async function runAction(action, id, el) {
+  switch (action) {
+    case 'refresh': await load(); toast('Up to date.'); break;
+    case 'close-modal': closeModal(); break;
+    case 'logout': await fetch('/api/logout', {method: 'POST'}).catch(() => {}); window.location.href = '/login'; break;
+    case 'theme': {
+      const dark = document.documentElement.dataset.theme ? document.documentElement.dataset.theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+      const next = dark ? 'light' : 'dark'; try { localStorage.setItem('aurva-theme', next); } catch (e) {} applyTheme(next); break;
+    }
+    case 'new-kit': newKit(); break;
+    case 'edit-kit': editKit(kitById(id)); break;
+    case 'new-component': newComponent(); break;
+    case 'new-supplier': addSupplier(el.dataset.component || ''); break;
+    case 'edit-component': editComponent(compById(id)); break;
+    case 'receive': receiveComponent(compById(id)); break;
+    case 'count-component': countComponent(compById(id)); break;
+    case 'convert': splitComponents(); break;
+    case 'count-kit': countKit(kitById(id)); break;
+    case 'recipe': editRecipe(kitById(id)); break;
+    case 'add-recipe-row': $('#recipe-rows').insertAdjacentHTML('beforeend', recipeRow()); break;
+    case 'remove-recipe-row': el.closest('.recipe-row')?.remove(); break;
+    case 'standard-recipe': standardParts(kitById(id)); break;
+    case 'edit-supplier': editSupplier(supplierById(id)); break;
+    case 'price-history': priceHistory(supplierById(id)); break;
+    case 'reorder-filter': REORDER_FILTER = el.dataset.filter; render(); break;
+    case 'pack-mode': PACK_MODE = el.dataset.mode; PACK_QTY = {}; render(); break;
+    case 'pack-clear': PACK_QTY = {}; render(); break;
+    case 'pack-preview': packPreview(); break;
+    case 'pack-save': await packSave(el); break;
+    case 'step': {
+      const next = Math.max(0, (Number(PACK_QTY[id]) || 0) + Number(el.dataset.step));
+      if (next) PACK_QTY[id] = next; else delete PACK_QTY[id];
+      const inp = $(`.pack-input[data-id="${id}"]`); if (inp) inp.value = next || '';
+      updatePackSummary(); break;
+    }
+    case 'unlock': unlockKit(kitById(id)); break;
+    case 'unlock-confirm':
+      el.disabled = true;
+      await request(`/api/kits/${id}/confirm-recipe`, {skip_pending: true}); closeModal(); await load(); toast('Packing unlocked. Parts will be deducted when you pack.'); break;
     case 'confirm-recipe':
-      if(!confirm('Have you included every component needed to pack one kit? This enables automatic deductions.'))return;
-      await request(`/api/kits/${id}/confirm-recipe`,{});await load();toast('Recipe confirmed; this SKU is ready to pack.');break;
+      if (!confirm('Does this recipe include every part needed to pack one kit?')) return;
+      await request(`/api/kits/${id}/confirm-recipe`, {}); await load(); toast('Recipe confirmed. Ready to pack.'); break;
   }
 }
-document.addEventListener('click',ev=>{
-  const tab=ev.target.closest('[data-tab]');if(tab){TAB=tab.dataset.tab;SEARCH='';render();return;}
-  const a=ev.target.closest('[data-action]');if(a){ev.preventDefault();runAction(a.dataset.action,a.dataset.id,a).catch(err=>toast(err.message,true));}
-  if(ev.target.id==='modal-overlay')closeModal();
+document.addEventListener('click', ev => {
+  const tab = ev.target.closest('[data-tab]');
+  if (tab) { TAB = tab.dataset.tab; SEARCH = ''; closeModal(); render(); window.scrollTo({top: 0}); try { history.replaceState(null, '', '#' + TAB); } catch (e) {} return; }
+  const a = ev.target.closest('[data-action]');
+  if (a && !a.disabled) { ev.preventDefault(); runAction(a.dataset.action, a.dataset.id, a).catch(err => { toast(err.message, true); a.disabled = false; }); }
+  if (ev.target.id === 'modal-overlay') closeModal();
 });
-document.addEventListener('input',ev=>{
-  if(ev.target.id==='list-search'){
-    const position=ev.target.selectionStart;
-    SEARCH=ev.target.value;
-    const el=$('#content');
-    if(TAB==='kits')el.innerHTML=renderKits();
-    if(TAB==='components')el.innerHTML=renderComponents();
-    if(TAB==='suppliers')el.innerHTML=renderSuppliers();
-    const s=$('#list-search');if(s){s.focus();s.setSelectionRange(position,position);}
+document.addEventListener('input', ev => {
+  if (ev.target.classList.contains('pack-input')) {
+    const n = Math.max(0, Math.floor(Number(ev.target.value) || 0));
+    if (n) PACK_QTY[ev.target.dataset.id] = n; else delete PACK_QTY[ev.target.dataset.id];
+    updatePackSummary(); return;
+  }
+  if (ev.target.id === 'list-search') {
+    const pos = ev.target.selectionStart; SEARCH = ev.target.value; render();
+    const s = $('#list-search'); if (s) { s.focus(); s.setSelectionRange(pos, pos); }
   }
 });
-document.addEventListener('keydown',ev=>{if(ev.key==='Escape')closeModal();});
-load().catch(err=>{$('#content').innerHTML=`<div class="empty"><strong>Warehouse server unavailable</strong>${esc(err.message)}</div>`;$('#sync-status').textContent='● Offline';});
+document.addEventListener('keydown', ev => { if (ev.key === 'Escape') closeModal(); });
+
+const startTab = location.hash.slice(1);
+if (PAGES[startTab]) TAB = startTab;
+applyTheme(storedTheme());
+load().catch(err => { $('#content').innerHTML = `<div class="empty"><strong>Can’t load the warehouse</strong>${esc(err.message)}</div>`; setSync(false); });
+setInterval(() => { if (document.visibilityState === 'visible' && $('#modal-overlay').classList.contains('hidden') && !packEntries().length) load().catch(() => setSync(false)); }, 60000);

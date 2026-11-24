@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#111111" />
+  <title>Sign in · Aurva Warehouse</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/style.css" />
+  <script defer src="/login.js"></script>
+</head>
+<body>
+<div class="login-page">
+  <section class="login-art" aria-hidden="true">
+    <div class="brand"><img class="brand-logo" src="/logo.svg" alt="" /><div class="wordmark">aurva<br/>world<small>PBN Warehouse</small></div></div>
+    <div>
+      <h2>Every kit, every colour, accounted for.</h2>
+      <p>Record what you packed, watch parts get deducted automatically, and reorder before anything runs out.</p>
+      <div class="swatches"><span></span><span></span><span></span><span></span><span></span></div>
+    </div>
+    <div class="art-foot">Private warehouse · Aurva World</div>
+  </section>
+  <main class="login-form-wrap">
+    <div class="login-card">
+      <div class="brand login-mobile-brand"><img class="brand-logo" src="/logo.svg" alt="" /><div class="wordmark">aurva<br/>world</div></div>
+      <h1>Welcome back</h1>
+      <p class="lead">Sign in to the Aurva PBN warehouse.</p>
+      <form id="login-form" novalidate>
+        <div class="field"><label for="username">Username</label><input class="input" id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required /></div>
+        <div class="field"><label for="password">Password</label>
+          <div class="pw-wrap"><input class="input" id="password" name="password" type="password" autocomplete="current-password" required /><button type="button" class="pw-toggle" id="pw-toggle" aria-controls="password">Show</button></div>
+        </div>
+        <div id="login-error" class="login-error hidden" role="alert"></div>
+        <button class="btn btn-primary btn-block" type="submit" id="login-submit">Sign in</button>
+      </form>
+      <p class="login-note">You'll stay signed in on this device for 14 days. Forgot the password? It's set in Railway → Variables → AURVA_PASSWORD.</p>
+    </div>
+  </main>
+</div>
+</body>
+</html>

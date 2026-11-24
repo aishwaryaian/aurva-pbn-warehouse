@@ -219,5 +219,89 @@ class WarehouseSmokeTests(unittest.TestCase):
         self.assertEqual(final['BRUSH-FINE']['qty'],2)
         self.assertGreater(len(self.get('/api/state')['activity']),5)
 
+    def test_unlock_batch_pack_and_alerts(self):
+        s=self.get('/api/state')
+        self.assertEqual(s['database']['engine'],'SQLite')
+        kits={k['sku']:k for k in s['kits']}
+        comps={c['code']:c for c in s['components']}
+        # Uncounted 0-stock designs now show as low stock; parts get automatic alert levels.
+        self.assertTrue(kits['PN0A4-91-0004']['low_stock'])
+        self.assertEqual(comps['HOOK']['alert_level'],20)
+        self.assertEqual(comps['CORD-CM']['alert_level'],500)
+        self.assertEqual(comps['EMPTY-CUT-3']['alert_rule'],'none')
+        goldi=kits['PN0A4-91-0004']
+        # Unlocking skips the unmeasured adhesive only when explicitly asked.
+        self.post(f'/api/kits/{goldi["id"]}/confirm-recipe',{'skip_pending':True})
+        # Stock every recipe part for 3 kits, plus paint strips (12 pots = 2 strips/kit).
+        for r in goldi['recipe']:
+            self.post(f'/api/components/{r["component_id"]}/count',{'qty':r['qty_per_kit']*3})
+        self.post(f'/api/components/{comps["EMPTY-6POT"]["id"]}/count',{'qty':6})
+        res=self.post('/api/pack-batch',{'items':[
+            {'kit_id':goldi['id'],'quantity':5},
+            {'kit_id':kits['PN0A4-91-0005']['id'],'quantity':2},
+            {'kit_id':kits['PN0A4-91-0006']['id'],'quantity':''}]})
+        byid={r['kit_id']:r for r in res['results']}
+        self.assertEqual(byid[goldi['id']]['packed'],3)
+        self.assertTrue(byid[goldi['id']]['limited'])
+        self.assertIn('adhesive',byid[kits['PN0A4-91-0005']['id']]['error'].lower())
+        self.assertEqual(len(res['results']),2)
+        after=self.get('/api/state')
+        g=next(k for k in after['kits'] if k['id']==goldi['id'])
+        self.assertEqual(g['packed_qty'],3)
+        self.assertTrue(g['low_stock'])
+        c={x['code']:x for x in after['components']}
+        self.assertEqual(c['HOOK']['qty'],0)
+        self.assertEqual(c['EMPTY-6POT']['qty'],0)
+        self.assertTrue(c['HOOK']['low_stock'])
+        self.post('/api/pack-batch',{'items':[]},400)
+
+
+class LoginTests(unittest.TestCase):
+    """Hosted mode: pages need a signed-in session cookie."""
+    @classmethod
+    def setUpClass(cls):
+        cls.temp=tempfile.TemporaryDirectory()
+        env={**os.environ,'AURVA_DB_PATH':str(Path(cls.temp.name)/'t.db'),'AURVA_PORT':str(PORT+1),
+             'AURVA_HOST':'0.0.0.0',
+             'AURVA_USER':'tester','AURVA_PASSWORD':'correct-horse-battery'}
+        cls.url=f'http://127.0.0.1:{PORT+1}'
+        cls.proc=subprocess.Popen([sys.executable,str(APP)],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        for _ in range(100):
+            try:
+                urlopen(cls.url+'/login',timeout=3); break
+            except Exception:
+                time.sleep(.07)
+        else:
+            raise RuntimeError('Server did not start')
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.proc.terminate(); cls.proc.wait(timeout=5); cls.temp.cleanup()
+
+    def call(self,path,body=None,cookie=None):
+        headers={'Content-Type':'application/json'}
+        if cookie: headers['Cookie']=cookie
+        req=Request(self.url+path,json.dumps(body).encode() if body is not None else None,headers=headers,
+                    method='POST' if body is not None else 'GET')
+        try:
+            with urlopen(req,timeout=3) as r:
+                return r.status,r.headers,r.read()
+        except HTTPError as e:
+            return e.code,e.headers,e.read()
+
+    def test_login_flow(self):
+        self.assertEqual(self.call('/login')[0],200)
+        self.assertEqual(self.call('/logo.svg')[0],200)
+        self.assertEqual(self.call('/api/state')[0],401)
+        status,_,body=self.call('/api/login',{'username':'tester','password':'wrong'})
+        self.assertEqual(status,401)
+        status,headers,_=self.call('/api/login',{'username':'tester','password':'correct-horse-battery'})
+        self.assertEqual(status,200)
+        cookie=headers['Set-Cookie'].split(';')[0]
+        self.assertIn('HttpOnly',headers['Set-Cookie'])
+        self.assertEqual(self.call('/api/state',cookie=cookie)[0],200)
+        self.assertEqual(self.call('/',cookie=cookie)[0],200)
+        self.assertEqual(self.call('/api/state',cookie=cookie[:-3]+'abc')[0],401)
+
 if __name__=='__main__':
     unittest.main(verbosity=2)

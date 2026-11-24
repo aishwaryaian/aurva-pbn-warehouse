@@ -3,40 +3,44 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="theme-color" content="#f6f5f1" />
-  <title>Aurva World · PBN Warehouse</title>
+  <meta name="theme-color" content="#f4f3ef" />
+  <title>Aurva Warehouse</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
   <link rel="stylesheet" href="/style.css" />
   <script defer src="/app.js"></script>
 </head>
 <body>
 <div class="app-shell">
   <aside class="sidebar">
-    <div class="brand"><span class="brand-mark">a<span>.</span></span><div><strong>AURVA WORLD</strong><small>PAINT BY NUMBER · WAREHOUSE</small></div></div>
-    <div class="side-title">WORKSPACE</div>
-    <nav class="navigation" aria-label="Primary navigation">
-      <button data-tab="dashboard" class="nav-button active"><span class="nav-icon">▦</span> Overview</button>
-      <button data-tab="kits" class="nav-button"><span class="nav-icon">◫</span> Products &amp; stock</button>
-      <button data-tab="components" class="nav-button"><span class="nav-icon">◈</span> Components</button>
-      <button data-tab="suppliers" class="nav-button"><span class="nav-icon">↗</span> Suppliers</button>
-      <button data-tab="activity" class="nav-button"><span class="nav-icon">◷</span> Activity</button>
+    <a class="brand" href="/"><img class="brand-logo" src="/logo.svg" alt="" /><div class="wordmark">aurva<br/>world<small>PBN Warehouse</small></div></a>
+    <div class="nav-label">Workspace</div>
+    <nav class="navigation" aria-label="Main">
+      <button data-tab="dashboard" class="nav-button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>Overview</button>
+      <button data-tab="pack" class="nav-button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8 12 3 3 8v8l9 5 9-5z"/><path d="m3 8 9 5 9-5M12 13v8"/></svg>Pack orders</button>
+      <button data-tab="kits" class="nav-button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m3 16 5-5 4 4 3-3 6 6"/><circle cx="15.5" cy="8.5" r="1.5"/></svg>Designs</button>
+      <button data-tab="components" class="nav-button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="7.5" r="1.6"/><circle cx="7.5" cy="13" r="1.6"/><circle cx="16.5" cy="13" r="1.6"/></svg>Parts stock<span class="nav-count hidden" id="count-parts"></span></button>
+      <button data-tab="reorder" class="nav-button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/></svg>Reorder links<span class="nav-count hidden" id="count-reorder"></span></button>
+      <button data-tab="activity" class="nav-button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>Activity</button>
     </nav>
     <div class="sidebar-foot">
-      <span class="dot-online"></span> Private warehouse database
-      <p>Shopify-free · Manual handovers</p>
+      <div class="db-card" id="db-card"><span class="db-title"><span class="dot"></span>Database</span><span class="db-note">Loading…</span></div>
+      <div class="foot-actions"><button class="btn btn-secondary btn-small" data-action="theme" id="theme-btn">Dark mode</button><button class="btn btn-secondary btn-small" data-action="logout">Sign out</button></div>
     </div>
   </aside>
-  <main class="main-content">
-    <header class="page-header">
-      <div><span class="eyebrow">AURVA / OPERATIONS</span><h1 id="page-title">Warehouse overview</h1><p id="page-subtitle">A clear view of what’s packed, what needs packing, and what to reorder.</p></div>
-      <div class="header-actions"><span id="sync-status" class="sync-status">● Live inventory data</span><button class="btn btn-secondary" data-action="refresh">Refresh ↻</button></div>
-    </header>
-    <div id="content" aria-live="polite"><div class="loading">Loading warehouse…</div></div>
-    <footer class="site-footer">Aurva World · Paint-by-Number Warehouse <span>Keep regular database backups</span></footer>
+  <main class="main">
+    <div class="main-inner">
+      <header class="page-header">
+        <div><span class="eyebrow" id="page-eyebrow">Aurva World</span><h1 id="page-title">Overview</h1><p id="page-subtitle"></p></div>
+        <div class="header-actions"><span class="sync" id="sync-status"><span class="dot"></span>Live</span><button class="btn btn-secondary btn-small" data-action="refresh">Refresh</button></div>
+      </header>
+      <div id="content" aria-live="polite"><div class="loading">Loading warehouse…</div></div>
+      <footer class="site-footer"><span>Aurva World · Paint-by-Number Warehouse</span><span id="footer-db"></span></footer>
+    </div>
   </main>
 </div>
 <div id="modal-overlay" class="overlay hidden" role="presentation">
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
-    <div class="modal-head"><div><span class="eyebrow" id="modal-kicker">WAREHOUSE ACTION</span><h2 id="modal-title"></h2></div><button class="icon-button" aria-label="Close" data-action="close-modal">✕</button></div>
+    <div class="modal-head"><div><span class="eyebrow" id="modal-kicker"></span><h2 id="modal-title"></h2></div><button class="icon-button" aria-label="Close" data-action="close-modal">✕</button></div>
     <div id="modal-body"></div>
   </div>
 </div>

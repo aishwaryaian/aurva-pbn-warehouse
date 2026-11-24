@@ -1,0 +1,4 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" role="img" aria-label="Aurva World">
+  <path d="M0 0H68A32 32 0 0 1 100 32V100H32A32 32 0 0 1 0 68Z" fill="#111"/>
+  <path d="M64 82A16 16 0 1 1 80 66V77Q80 84 87 85" fill="none" stroke="#fff" stroke-width="8.5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

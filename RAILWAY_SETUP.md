@@ -37,7 +37,7 @@ Once variables and volume are added, apply/deploy the pending changes (or redepl
 
 Railway warehouse service → **Settings → Networking → Public Networking → Generate Domain**.
 
-Open the generated HTTPS address in your browser. A login prompt asks for your `AURVA_USER` and `AURVA_PASSWORD`.
+Open the generated HTTPS address in your browser. The Aurva login page asks for your `AURVA_USER` and `AURVA_PASSWORD`.
 
 ## 6 — Turn on backups
 
@@ -48,7 +48,7 @@ Service → **Backups** tab → enable scheduled volume backups, preferably dail
 - **Deployment failed** / error mentions credentials: check `AURVA_USER` and `AURVA_PASSWORD`, then redeploy.
 - **Deployment failed** / database error: confirm the **volume is mounted at `/data`** and the variable `AURVA_DB_PATH` equals `/data/aurva.db`.
 - **Application failed to respond**: confirm it shows Active before generating the domain. The app reads Railway's `PORT` automatically and binds to `0.0.0.0`.
-- **401 or browser login prompt**: use your credentials from Railway Variables. Do not share them.
+- **Login page**: sign in with the AURVA_USER and AURVA_PASSWORD from Railway Variables. Changing the password signs everyone out. Do not share them.
 - **Can't see inventory after a new deployment**: check that the service is still using the same persistent volume. Do not enter production stock records until the volume is attached.
 
 ## Data model & important limits

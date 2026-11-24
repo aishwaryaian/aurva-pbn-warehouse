@@ -8,18 +8,22 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import hmac
 import json
 import math
 import os
 import re
 import sqlite3
+import secrets
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
+from http.cookies import SimpleCookie
 
 ROOT = Path(__file__).resolve().parent
 RAILWAY = bool(os.environ.get('RAILWAY_ENVIRONMENT') or os.environ.get('RAILWAY_PROJECT_ID'))
@@ -31,6 +35,15 @@ AUTH_USER = os.environ.get('AURVA_USER', '')
 AUTH_PASSWORD = os.environ.get('AURVA_PASSWORD', '')
 SECURE_MODE = RAILWAY or HOST not in ('127.0.0.1', 'localhost', '::1')
 LOCK = threading.RLock()
+SESSION_COOKIE = 'aurva_session'
+SESSION_DAYS = 14
+# Signing key: an explicit AURVA_SECRET if set, otherwise derived from the login
+# credentials so that changing the password logs everyone out.
+SESSION_KEY = hashlib.sha256(('aurva-session|' + (os.environ.get('AURVA_SECRET') or
+                              AUTH_USER + '|' + AUTH_PASSWORD)).encode()).digest()
+LOGIN_FAILURES = {}
+LOGIN_LIMIT = 8
+LOGIN_WINDOW = 15 * 60
 THRESHOLD = 10
 
 # Verified active PBN catalogue, without A5 variants pending phase-out count.
@@ -466,9 +479,34 @@ def state():
             _, _, full_available, leftover_sections = paint_stock(components)
             k['can_make'] = plan_paint_strips(full_available, leftover_sections,
                                               k['paint_colours'], k['can_make'])['packed']
-        k['low_stock'] = bool(k['stock_counted']) and k['packed_qty'] <= THRESHOLD
+        k['low_stock'] = k['packed_qty'] <= THRESHOLD
+        k['missing'] = [compmap[r['component_id']]['name'] for r in b
+                        if compmap[r['component_id']]['qty'] + 1e-8 < r['qty_per_kit']]
+    # Component alert level: your own minimum if set, otherwise "enough for
+    # THRESHOLD more kits" of the design that uses the most of it.
+    per_kit = {}
+    for r in recipes:
+        per_kit[r['component_id']] = max(per_kit.get(r['component_id'], 0), r['qty_per_kit'])
+    strips = max(((k['paint_colours'] + 5) // 6 for k in kits if k['paint_colours']), default=0)
+    for c in components:
+        if c['min_qty'] > 0:
+            level, rule = c['min_qty'], 'custom'
+        elif c['code'].upper().startswith('EMPTY-CUT-'):
+            level, rule = 0, 'none'
+        elif c['code'].upper() == 'EMPTY-6POT' and strips:
+            level, rule = THRESHOLD * strips, 'kits'
+        elif c['id'] in per_kit:
+            level, rule = round(THRESHOLD * per_kit[c['id']], 4), 'kits'
+        else:
+            # Not used by any design and no minimum set: nothing to warn about.
+            level, rule = 0, 'none'
+        c['alert_level'], c['alert_rule'] = level, rule
+        c['low_stock'] = rule != 'none' and c['qty'] <= level
+        c['used_in'] = sum(1 for r in recipes if r['component_id'] == c['id'])
     return {'kits':kits,'components':components,'suppliers':suppliers, 'price_history':history,
-            'activity':activity,'threshold':THRESHOLD,'timestamp':now()}
+            'activity':activity,'threshold':THRESHOLD,'timestamp':now(),
+            'database':{'engine':'SQLite','path':str(DB),
+                        'hosted':RAILWAY,'persistent':bool(MOUNT or os.environ.get('AURVA_DB_PATH'))}}
 
 
 def create_kit(body):
@@ -629,13 +667,18 @@ def save_recipe(kid, body):
         return {'ok':True}
 
 
-def confirm_recipe(kid):
+def confirm_recipe(kid, body=None):
+    skip = bool((body or {}).get('skip_pending'))
     with transaction() as conn:
         kit = fetchrow(conn,'kits',kid)
         count=conn.execute('SELECT COUNT(*) FROM recipes WHERE kit_id=?',(kid,)).fetchone()[0]
         if not count:
             raise Problem('Add components to the recipe before confirming it.')
-        if kit['recipe_pending_reason']:
+        if kit['recipe_pending_reason'] and skip:
+            audit(conn,'Packing unlocked',f'{kit["sku"]}: confirmed without deducting adhesive ('
+                  +kit['recipe_pending_reason']+')')
+            conn.execute("UPDATE kits SET recipe_pending_reason='' WHERE id=?",(kid,))
+        elif kit['recipe_pending_reason']:
             raise Problem('Cannot confirm this recipe yet: '+kit['recipe_pending_reason']+
                           '. No adhesive quantity will be guessed.',409)
         if kit['paint_colours'] is not None:
@@ -652,6 +695,41 @@ def confirm_recipe(kid):
 def pack_kits(kid, body):
     requested = positive_int(body.get('quantity'), 'Packed quantity')
     with transaction() as conn:
+        return pack_in(conn, kid, requested)
+
+
+def pack_batch(body):
+    """Record packing for several designs at once. Each design packs as many
+    as its components allow; problems for one design don't block the others."""
+    items = body.get('items')
+    if not isinstance(items, list) or not items:
+        raise Problem('Enter how many kits you packed for at least one design.')
+    wanted = []
+    for item in items:
+        try:
+            kid = int(item.get('kit_id'))
+        except (TypeError, ValueError, AttributeError):
+            raise Problem('Each row needs a valid design.')
+        qty = item.get('quantity')
+        if qty in (None, '', 0, '0'):
+            continue
+        wanted.append((kid, positive_int(qty, 'Packed quantity')))
+    if not wanted:
+        raise Problem('Enter how many kits you packed for at least one design.')
+    results = []
+    for kid, qty in wanted:
+        try:
+            with transaction() as conn:
+                r = pack_in(conn, kid, qty)
+                r['kit_id'] = kid
+                results.append(r)
+        except Problem as e:
+            results.append({'kit_id': kid, 'packed': 0, 'requested': qty, 'limited': True, 'error': e.msg})
+    return {'results': results, 'packed': sum(r['packed'] for r in results)}
+
+
+def pack_in(conn, kid, requested):
+    if True:
         kit = fetchrow(conn,'kits',kid)
         if kit['recipe_pending_reason']:
             raise Problem('Packing is blocked: '+kit['recipe_pending_reason']+'.',409)
@@ -760,10 +838,11 @@ def route(method,path,body):
     if path=='/api/components': return create_component(body)
     if path=='/api/convert': return convert_component(body)
     if path=='/api/suppliers': return create_supplier(body)
+    if path=='/api/pack-batch': return pack_batch(body)
     m=re.fullmatch(r'/api/kits/(\d+)/(recipe|confirm-recipe|pack|handover|count)',path)
     if m:
         kid=int(m.group(1)); action=m.group(2)
-        return {'recipe':save_recipe,'confirm-recipe':lambda id,b:confirm_recipe(id),
+        return {'recipe':save_recipe,'confirm-recipe':confirm_recipe,
                 'pack':pack_kits,'handover':handover,'count':count_kit}[action](kid,body)
     m=re.fullmatch(r'/api/components/(\d+)/(update|receive|count)',path)
     if m:
@@ -775,8 +854,42 @@ def route(method,path,body):
 
 class AppHandler(BaseHTTPRequestHandler):
     server_version='AurvaWarehouse/1.0'
+    def client_ip(self):
+        forwarded = self.headers.get('X-Forwarded-For', '')
+        return forwarded.split(',')[0].strip() if forwarded else self.client_address[0]
+
+    def session_valid(self):
+        cookie = SimpleCookie()
+        try:
+            cookie.load(self.headers.get('Cookie', ''))
+        except Exception:
+            return False
+        morsel = cookie.get(SESSION_COOKIE)
+        if not morsel:
+            return False
+        try:
+            expiry, signature = morsel.value.split('.', 1)
+            if int(expiry) < time.time():
+                return False
+        except ValueError:
+            return False
+        good = hmac.new(SESSION_KEY, expiry.encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(signature, good)
+
+    def session_cookie(self, clear=False):
+        if clear:
+            value, age = '', 0
+        else:
+            expiry = str(int(time.time()) + SESSION_DAYS * 86400)
+            value = expiry + '.' + hmac.new(SESSION_KEY, expiry.encode(), hashlib.sha256).hexdigest()
+            age = SESSION_DAYS * 86400
+        flags = '; Secure' if RAILWAY else ''
+        return f'{SESSION_COOKIE}={value}; Max-Age={age}; Path=/; HttpOnly; SameSite=Strict{flags}'
+
     def authorized(self):
         if not SECURE_MODE:
+            return True
+        if self.session_valid():
             return True
         header = self.headers.get('Authorization', '')
         if not header.startswith('Basic '):
@@ -789,50 +902,94 @@ class AppHandler(BaseHTTPRequestHandler):
         return (hmac.compare_digest(username, AUTH_USER) and
                 hmac.compare_digest(password, AUTH_PASSWORD))
 
-    def check_authorized(self):
+    def check_authorized(self, path='/'):
         if self.authorized():
             return True
-        self.send_response(401)
-        self.send_header('WWW-Authenticate', 'Basic realm="Aurva PBN Warehouse", charset="UTF-8"')
-        self.send_header('Cache-Control', 'no-store')
-        self.send_header('Content-Length', '0')
-        self.end_headers()
+        if path.startswith('/api/'):
+            self.json_result(401, {'error': 'Your session has ended. Please sign in again.', 'login': True})
+        else:
+            self.send_response(303)
+            self.send_header('Location', '/login')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Content-Length', '0')
+            self.end_headers()
         return False
 
-    def send_bytes(self,status,content,kind):
+    def login(self, body):
+        ip = self.client_ip()
+        now_t = time.time()
+        recent = [t for t in LOGIN_FAILURES.get(ip, []) if now_t - t < LOGIN_WINDOW]
+        LOGIN_FAILURES[ip] = recent
+        if len(recent) >= LOGIN_LIMIT:
+            return self.json_result(429, {'error': 'Too many attempts. Please wait 15 minutes and try again.'})
+        user = str(body.get('username') or '')
+        password = str(body.get('password') or '')
+        ok = (not SECURE_MODE) or (hmac.compare_digest(user.encode(), AUTH_USER.encode()) and
+                                   hmac.compare_digest(password.encode(), AUTH_PASSWORD.encode()))
+        if not ok:
+            recent.append(now_t)
+            return self.json_result(401, {'error': 'That username or password is not right.'})
+        LOGIN_FAILURES.pop(ip, None)
+        return self.json_result(200, {'ok': True}, cookie=self.session_cookie())
+
+    def send_bytes(self,status,content,kind,cookie=None):
         self.send_response(status)
+        if cookie:
+            self.send_header('Set-Cookie',cookie)
         self.send_header('Content-Type',kind)
         self.send_header('X-Content-Type-Options','nosniff')
         self.send_header('Cache-Control','no-store')
         self.send_header('X-Frame-Options','DENY')
         self.send_header('Referrer-Policy','no-referrer')
-        self.send_header('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+        self.send_header('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
         if RAILWAY:
             self.send_header('Strict-Transport-Security','max-age=31536000; includeSubDomains')
         self.send_header('Content-Length',str(len(content)))
         self.end_headers()
         self.wfile.write(content)
 
+    PUBLIC = {
+        '/login': ('login.html', 'text/html; charset=utf-8'),
+        '/login.js': ('login.js', 'text/javascript; charset=utf-8'),
+        '/style.css': ('style.css', 'text/css; charset=utf-8'),
+        '/logo.svg': ('logo.svg', 'image/svg+xml'),
+        '/favicon.svg': ('favicon.svg', 'image/svg+xml'),
+    }
+    PRIVATE = {
+        '/': ('index.html', 'text/html; charset=utf-8'),
+        '/index.html': ('index.html', 'text/html; charset=utf-8'),
+        '/app.js': ('app.js', 'text/javascript; charset=utf-8'),
+    }
+
+    def do_HEAD(self):
+        self.send_response(200 if urlparse(self.path).path in self.PUBLIC else 303)
+        self.end_headers()
+
     def do_GET(self):
-        if not self.check_authorized():
-            return
         path=urlparse(self.path).path
+        if path=='/favicon.ico':
+            path='/favicon.svg'
+        if path=='/login' and (not SECURE_MODE or self.session_valid()):
+            self.send_response(303); self.send_header('Location','/'); self.send_header('Content-Length','0'); self.end_headers()
+            return
+        if path in self.PUBLIC:
+            name, kind = self.PUBLIC[path]
+            return self.send_bytes(200,(ROOT/'static'/name).read_bytes(),kind)
+        if not self.check_authorized(path):
+            return
         if path.startswith('/api/'):
             return self.handle_api('GET',path,{})
-        if path in ('/','/index.html'):
-            file=ROOT/'static'/'index.html'; kind='text/html; charset=utf-8'
-        elif path=='/app.js':
-            file=ROOT/'static'/'app.js'; kind='text/javascript; charset=utf-8'
-        elif path=='/style.css':
-            file=ROOT/'static'/'style.css'; kind='text/css; charset=utf-8'
-        else:
+        if path not in self.PRIVATE:
             return self.send_bytes(404,b'Not found','text/plain')
-        self.send_bytes(200,file.read_bytes(),kind)
+        name, kind = self.PRIVATE[path]
+        self.send_bytes(200,(ROOT/'static'/name).read_bytes(),kind)
 
     def do_POST(self):
-        if not self.check_authorized():
-            return
         path=urlparse(self.path).path
+        if path=='/api/logout':
+            return self.json_result(200,{'ok':True},cookie=self.session_cookie(clear=True))
+        if path!='/api/login' and not self.check_authorized(path):
+            return
         if not path.startswith('/api/'):
             return self.send_bytes(404,b'Not found','text/plain')
         if self.headers.get('Content-Type','').split(';')[0].strip()!='application/json':
@@ -848,6 +1005,8 @@ class AppHandler(BaseHTTPRequestHandler):
             return self.json_result(400,{'error':'Invalid JSON request.'})
         except Problem as e:
             return self.json_result(e.status,{'error':e.msg})
+        if path=='/api/login':
+            return self.login(body)
         self.handle_api('POST',path,body)
 
     def handle_api(self,method,path,body):
@@ -864,8 +1023,8 @@ class AppHandler(BaseHTTPRequestHandler):
             print('Internal error:',repr(e))
             return self.json_result(500,{'error':'Unexpected server error. Check terminal.'})
 
-    def json_result(self,status,payload):
-        return self.send_bytes(status,json.dumps(payload).encode('utf-8'),'application/json; charset=utf-8')
+    def json_result(self,status,payload,cookie=None):
+        return self.send_bytes(status,json.dumps(payload).encode('utf-8'),'application/json; charset=utf-8',cookie)
 
     def log_message(self,fmt,*args):
         if not self.path.startswith('/api/state'):

@@ -37,6 +37,8 @@ The sidebar in the app always shows the database path in use.
 - **Low-stock alerts**: a design alerts at **10 or fewer** packed kits. A part alerts when only enough is left for 10 kits (for example 20 hooks or 500 cm cord), or at your own minimum if you set one.
 - **Reorder links**: save supplier links and prices per part; low parts are listed first with a one-click *Reorder* button.
 - **Bulk upload (Excel)**: download the stock sheet, change the numbers in Excel, then drag the file onto the Bulk upload page (or press Upload file). Choose *Stock count* to replace quantities or *Stock received* to add to them. A preview shows every change before you press Save. Works with `.xlsx` and `.csv`; uploading packed stock doesn't deduct parts.
+- **Any Excel layout**: after you drop a file, the app finds the heading row and guesses what each column is (e.g. "Qty in hand" → Stock quantity). Fix any guess with the dropdowns. Rows with only a name are matched to parts by name, including small spelling differences; matching never renames anything.
+- **Optional free AI help**: add `AI_API_KEY` in Railway Variables (a free Google Gemini key from https://aistudio.google.com/apikey). A **Let AI read it** button then appears, and AI can match item names that are written very differently. Only headings, a few sample rows and part names are sent. Optional: `AI_MODEL` (default tries `gemini-flash-latest`) and `AI_BASE_URL` (any OpenAI-compatible service, e.g. Groq or OpenRouter).
 - **Unlock packing**: designs whose adhesive use isn't measured yet start locked. *Unlock packing* lets you pack them now without deducting adhesive.
 
 **Test:** `python test_app.py` runs a temporary local smoke test.

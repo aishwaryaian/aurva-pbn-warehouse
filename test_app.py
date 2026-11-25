@@ -299,6 +299,42 @@ class WarehouseSmokeTests(unittest.TestCase):
         nohead=self.post('/api/import/preview',{'filename':'x.csv','data':enc(b'a,b\n1,2\n'),'mode':'set'},400)
         self.assertIn('Part code',nohead['error'])
 
+    def test_any_excel_layout(self):
+        import base64, importlib.util
+        spec=importlib.util.spec_from_file_location('aurva_app2',APP)
+        appmod=importlib.util.module_from_spec(spec); spec.loader.exec_module(appmod)
+        enc=lambda b: base64.b64encode(b).decode()
+        # A typical home-made sheet: title rows, own headings, names instead of codes.
+        book=appmod.xlsx_bytes([('Store room',['Aurva stock register Nov'],[
+            [],
+            ['Sl no','Item','Qty in hand','Vendor','Rate','Remarks'],
+            [1,'hanging hook',30,'','','ok'],
+            [2,'Hangng cord',800,'','',''],
+            [3,'Mystery glitter',5,'','',''],
+        ],[10]*6)])
+        info=self.post('/api/import/inspect',{'filename':'mine.xlsx','data':enc(book)})
+        self.assertFalse(info['ai'])
+        sh=info['sheets'][0]
+        self.assertEqual(sh['header_row'],3)
+        self.assertEqual(sh['kind'],'parts')
+        cols={int(k):v for k,v in sh['columns'].items()}
+        self.assertEqual(cols[1],'name'); self.assertEqual(cols[2],'qty'); self.assertEqual(cols[3],'supplier')
+        mapping=[{'sheet':'Store room','kind':'parts','header_row':3,'columns':{'1':'name','2':'qty'}}]
+        prev=self.post('/api/import/preview',{'filename':'mine.xlsx','data':enc(book),'mode':'set','mapping':mapping})
+        res={r['line']:r for r in prev['results']}
+        self.assertEqual(res[4]['key'],'HOOK')
+        self.assertEqual(res[5]['key'],'CORD-CM')
+        self.assertIn('similar name',' '.join(res[5]['changes']))
+        self.assertNotIn('renamed',' '.join(res[4]['changes']+res[5]['changes']))
+        self.assertEqual(res[6]['action'],'error')
+        self.assertIn('Mystery glitter',res[6]['error'])
+        # Changing the heading row is respected.
+        again=self.post('/api/import/inspect',{'filename':'mine.xlsx','data':enc(book),'header_rows':{'Store room':1}})
+        self.assertEqual(again['sheets'][0]['header_row'],1)
+        no_key=self.post('/api/import/preview',{'filename':'mine.xlsx','data':enc(book),'mode':'set',
+                         'mapping':[{'sheet':'Store room','kind':'parts','header_row':3,'columns':{'2':'qty'}}]},400)
+        self.assertIn('part code or part name',no_key['error'])
+
 
 class LoginTests(unittest.TestCase):
     """Hosted mode: pages need a signed-in session cookie."""
@@ -346,6 +382,69 @@ class LoginTests(unittest.TestCase):
         self.assertEqual(self.call('/api/state',cookie=cookie)[0],200)
         self.assertEqual(self.call('/',cookie=cookie)[0],200)
         self.assertEqual(self.call('/api/state',cookie=cookie[:-3]+'abc')[0],401)
+
+
+class AiTests(unittest.TestCase):
+    """The AI path, using a pretend OpenAI-compatible service on this computer."""
+    @classmethod
+    def setUpClass(cls):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        class Fake(BaseHTTPRequestHandler):
+            def log_message(self,*a): pass
+            def do_POST(self):
+                body=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                prompt=body['messages'][-1]['content']
+                if '"names"' in prompt:
+                    answer={'matches':{'golden fish canvas big':'CANVAS-PN0A4-91-0004','unknown thing':None}}
+                else:
+                    answer={'sheets':[{'sheet':'Sheet A','kind':'parts','header_row':2,'columns':{'0':'name','1':'qty','2':'nonsense'}}]}
+                out=json.dumps({'choices':[{'message':{'content':'```json\n'+json.dumps(answer)+'\n```'}}]}).encode()
+                self.send_response(200); self.send_header('Content-Type','application/json')
+                self.send_header('Content-Length',str(len(out))); self.end_headers(); self.wfile.write(out)
+        cls.fake=ThreadingHTTPServer(('127.0.0.1',PORT+3),Fake)
+        threading.Thread(target=cls.fake.serve_forever,daemon=True).start()
+        cls.temp=tempfile.TemporaryDirectory()
+        env={**os.environ,'AURVA_DB_PATH':str(Path(cls.temp.name)/'ai.db'),'AURVA_PORT':str(PORT+2),
+             'AI_API_KEY':'test-key','AI_BASE_URL':f'http://127.0.0.1:{PORT+3}/','AI_MODEL':'fake-model'}
+        cls.url=f'http://127.0.0.1:{PORT+2}'
+        cls.proc=subprocess.Popen([sys.executable,str(APP)],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        for _ in range(100):
+            try:
+                urlopen(cls.url+'/api/state',timeout=3); break
+            except Exception:
+                time.sleep(.07)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.proc.terminate(); cls.proc.wait(timeout=5); cls.temp.cleanup(); cls.fake.shutdown()
+
+    def post(self,path,body,expected=200):
+        req=Request(self.url+path,json.dumps(body).encode(),headers={'Content-Type':'application/json'},method='POST')
+        try:
+            with urlopen(req,timeout=10) as r:
+                self.assertEqual(r.status,expected); return json.loads(r.read())
+        except HTTPError as e:
+            self.assertEqual(e.code,expected,e.read()); return json.loads(e.read())
+
+    def test_ai_reads_columns_and_names(self):
+        import base64, importlib.util
+        spec=importlib.util.spec_from_file_location('aurva_app3',APP)
+        appmod=importlib.util.module_from_spec(spec); spec.loader.exec_module(appmod)
+        book=appmod.xlsx_bytes([('Sheet A',['My list'],[['Thing','How many','Notes'],
+                                ['golden fish canvas big',7,''],['unknown thing',2,'']],[10]*3)])
+        data=base64.b64encode(book).decode()
+        self.assertTrue(self.post('/api/import/inspect',{'filename':'a.xlsx','data':data})['ai'])
+        sheets=self.post('/api/import/ai-map',{'filename':'a.xlsx','data':data})['sheets']
+        self.assertEqual(sheets[0]['header_row'],2)
+        self.assertEqual(sheets[0]['columns'],{'0':'name','1':'qty'})   # invalid field dropped
+        mapping=[{'sheet':'Sheet A','kind':'parts','header_row':2,'columns':sheets[0]['columns']}]
+        prev=self.post('/api/import/preview',{'filename':'a.xlsx','data':data,'mode':'set','mapping':mapping,'ai_names':True})
+        res={r['line']:r for r in prev['results']}
+        self.assertEqual(res[3]['key'],'CANVAS-PN0A4-91-0004')
+        self.assertIn('AI matched',' '.join(res[3]['changes']))
+        self.assertEqual(res[4]['action'],'error')
+
 
 if __name__=='__main__':
     unittest.main(verbosity=2)

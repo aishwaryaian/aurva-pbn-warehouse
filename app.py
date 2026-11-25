@@ -945,8 +945,18 @@ def read_xlsx(data):
                     except ValueError:
                         val = v.text
                 values[col_index(c.get('r'))] = val
+            try:
+                number_ = int(row.get('r') or 0)
+            except ValueError:
+                number_ = 0
+            if number_ > len(rows) + 1:          # keep Excel row numbers: blank rows stay blank
+                if number_ > 20000:
+                    raise Problem('Please upload 5000 rows or fewer at a time.')
+                rows.extend([] for _ in range(number_ - len(rows) - 1))
             if values:
                 rows.append([values.get(i) for i in range(max(values) + 1)])
+            elif number_:
+                rows.append([])
             if len(rows) > 5000:
                 raise Problem('Please upload 5000 rows or fewer at a time.')
         sheets[sh.get('name', 'Sheet')] = rows
@@ -959,30 +969,6 @@ def read_csv(data):
     if len(rows) > 5000:
         raise Problem('Please upload 5000 rows or fewer at a time.')
     return {'CSV': rows}
-
-
-def find_tables(sheets):
-    """Find a header row in each sheet and decide whether it lists parts or designs."""
-    tables = []
-    for name, rows in sheets.items():
-        for i, row in enumerate(rows[:10]):
-            keys = [header_key(c) for c in row]
-            if 'code' in keys or 'sku' in keys:
-                kind = 'designs' if 'sku' in keys else 'parts'
-                records = []
-                for n, r in enumerate(rows[i + 1:], start=i + 2):
-                    rec = {}
-                    for k, v in zip(keys, r):
-                        if k and cell_text(v) != '':
-                            rec.setdefault(k, cell_text(v))
-                    if rec:
-                        records.append((n, rec))
-                tables.append({'sheet': name, 'kind': kind, 'records': records})
-                break
-    if not tables:
-        raise Problem('No stock table found. The first row needs column names, including "Part code" (for parts) '
-                      'or "SKU" (for designs). Download the Excel template to see the layout.')
-    return tables
 
 
 def fmt_num(n):
@@ -1116,13 +1102,325 @@ def import_design(conn, rec, mode):
     return sku, row['name'], 'update' if changes else 'same', changes
 
 
-def bulk_import(body, apply):
-    """Preview (apply=False) or save (apply=True) an uploaded stock sheet.
-    The preview runs the real changes inside a transaction and rolls back,
-    so what you see is exactly what Save will do."""
-    mode = body.get('mode')
-    if mode not in ('set', 'add'):
-        raise Problem('Choose whether the numbers are a stock count or stock received.')
+# ---------------------------------------------------------------------------
+# Reading any Excel layout: guess which column is what, let the person
+# confirm, optionally ask a (free) AI model for help.
+# ---------------------------------------------------------------------------
+import difflib
+import hashlib as _hashlib
+import urllib.request
+import urllib.error
+
+AI_API_KEY = os.environ.get('AI_API_KEY') or os.environ.get('GEMINI_API_KEY', '')
+AI_BASE_URL = os.environ.get('AI_BASE_URL', 'https://generativelanguage.googleapis.com/v1beta/openai/').rstrip('/') + '/'
+AI_MODELS = [m.strip() for m in os.environ.get('AI_MODEL', 'gemini-flash-latest,gemini-3.6-flash,gemini-3.5-flash').split(',') if m.strip()]
+AI_STATE = {'model': None}
+AI_NAME_CACHE = {}
+
+FIELD_LABELS = {
+    'parts': dict(PART_COLUMNS),
+    'designs': dict(DESIGN_COLUMNS),
+}
+# Keyword rules for headings that aren't an exact match (checked in order).
+KEYWORD_RULES = [
+    ('designs', 'sku', ('sku',)),
+    ('parts', 'code', ('code', 'itemno', 'partno', 'id')),
+    ('designs', 'packed_qty', ('packed',)),
+    ('parts', 'min_qty', ('minimum', 'min', 'reorderlevel', 'reorderpoint', 'alert', 'safety')),
+    ('parts', 'qty', ('qty', 'quantity', 'stock', 'onhand', 'inhand', 'balance', 'available', 'closing', 'count', 'nos', 'pieces')),
+    ('parts', 'url', ('link', 'url', 'website', 'http')),
+    ('parts', 'supplier', ('supplier', 'vendor', 'seller', 'shop', 'store', 'from')),
+    ('designs', 'selling_price', ('selling', 'saleprice', 'sp')),
+    ('designs', 'mrp', ('mrp',)),
+    ('parts', 'price', ('price', 'rate', 'cost', 'amount', 'rs', 'inr')),
+    ('parts', 'unit', ('unit', 'uom', 'measure')),
+    ('designs', 'size', ('size',)),
+    ('designs', 'paint_colours', ('colour', 'color', 'pots')),
+    ('designs', 'barcode', ('barcode', 'ean')),
+    ('parts', 'name', ('name', 'item', 'description', 'product', 'particulars', 'material', 'component', 'part', 'design', 'artwork', 'title')),
+]
+
+
+def norm(text):
+    return re.sub(r'[^a-z0-9]', '', str(text or '').lower())
+
+
+def guess_field(heading):
+    key = header_key(heading)
+    if key:
+        return key
+    n = norm(heading)
+    if not n:
+        return None
+    for _kind, field, words in KEYWORD_RULES:
+        if any(w in n for w in words):
+            return field
+    return None
+
+
+def find_header_row(rows):
+    """Pick the row (within the first 15) that looks most like column headings."""
+    best, best_score = None, 0
+    for i, row in enumerate(rows[:15]):
+        texts = [cell_text(c) for c in row]
+        filled = [t for t in texts if t]
+        if len(filled) < 2:
+            continue
+        wordy = sum(1 for t in filled if not re.fullmatch(r'[-\d.,₹ ]+', t))
+        known = sum(1 for t in filled if guess_field(t))
+        score = known * 3 + wordy
+        if score > best_score:
+            best, best_score = i, score
+    return best
+
+
+def sheet_kind(columns):
+    fields = set(columns.values())
+    design_only = {'sku', 'packed_qty', 'size', 'paint_colours', 'barcode', 'mrp', 'selling_price'}
+    return 'designs' if fields & design_only and not fields & {'code', 'supplier', 'url', 'unit'} else 'parts'
+
+
+def clean_mapping(kind, columns):
+    """Keep only valid fields for this kind, each used once (first column wins)."""
+    allowed = FIELD_LABELS.get(kind, {})
+    out, used = {}, set()
+    for idx, field in sorted(((int(i), f) for i, f in columns.items()), key=lambda x: x[0]):
+        if field in allowed and field not in used:
+            out[idx] = field
+            used.add(field)
+    return out
+
+
+def inspect_upload(sheets, header_rows=None):
+    result = []
+    for name, rows in sheets.items():
+        h = find_header_row(rows)
+        try:
+            forced = int((header_rows or {}).get(name) or 0)
+        except (TypeError, ValueError):
+            forced = 0
+        if 1 <= forced <= len(rows):
+            h = forced - 1
+        if h is None:
+            result.append({'sheet': name, 'header_row': None, 'headers': [], 'samples': [], 'kind': 'skip',
+                           'columns': {}, 'rows': len(rows)})
+            continue
+        headers = [cell_text(c) for c in rows[h]]
+        guess = {}
+        for i, head in enumerate(headers):
+            f = guess_field(head)
+            if f:
+                guess[i] = f
+        kind = sheet_kind(guess)
+        if kind == 'designs' and 'qty' in guess.values():
+            guess = {i: ('packed_qty' if f == 'qty' else f) for i, f in guess.items()}
+        if kind == 'parts' and 'sku' in guess.values():
+            guess = {i: ('code' if f == 'sku' else f) for i, f in guess.items()}
+        guess = clean_mapping(kind, guess)
+        has_key = bool(set(guess.values()) & {'code', 'sku', 'name'})
+        samples = [[cell_text(c) for c in r][:len(headers)] for r in rows[h + 1:h + 6]]
+        result.append({'sheet': name, 'header_row': h + 1, 'headers': headers, 'samples': samples,
+                       'kind': kind if has_key else 'skip', 'columns': {str(k): v for k, v in guess.items()},
+                       'rows': max(0, len(rows) - h - 1)})
+    return result
+
+
+def tables_from_mapping(sheets, mapping):
+    tables = []
+    for m in mapping:
+        kind = m.get('kind')
+        if kind not in ('parts', 'designs'):
+            continue
+        rows = sheets.get(m.get('sheet'))
+        if rows is None:
+            raise Problem(f'Sheet "{m.get("sheet")}" was not found in the file.')
+        try:
+            h = int(m.get('header_row')) - 1
+        except (TypeError, ValueError):
+            raise Problem('Choose which row has the column headings.')
+        cols = clean_mapping(kind, m.get('columns') or {})
+        if not set(cols.values()) & ({'sku', 'name'} if kind == 'designs' else {'code', 'name'}):
+            raise Problem(f'Sheet "{m.get("sheet")}": choose which column has the '
+                          + ('SKU or design name.' if kind == 'designs' else 'part code or part name.'))
+        records = []
+        for n, r in enumerate(rows[h + 1:], start=h + 2):
+            rec = {}
+            for idx, field in cols.items():
+                if idx < len(r) and cell_text(r[idx]) != '':
+                    rec[field] = cell_text(r[idx])
+            if set(rec) & {'code', 'sku', 'name'}:
+                records.append((n, rec))
+        tables.append({'sheet': m['sheet'], 'kind': kind, 'records': records})
+    if not tables:
+        raise Problem('Pick at least one sheet to import, and say which column has the part code or name.')
+    return tables
+
+
+def auto_tables(sheets):
+    mapping = [m for m in inspect_upload(sheets) if m['kind'] != 'skip']
+    if not mapping:
+        raise Problem('No stock table found. The first row needs column names, including "Part code" (for parts) '
+                      'or "SKU" (for designs). Download the Excel template to see the layout.')
+    return tables_from_mapping(sheets, mapping)
+
+
+# ---------- matching rows by name ----------
+def name_index(conn, kind):
+    if kind == 'designs':
+        rows = conn.execute('SELECT sku AS key, name FROM kits').fetchall()
+    else:
+        rows = conn.execute('SELECT code AS key, name FROM components').fetchall()
+    return [(r['key'], r['name']) for r in rows]
+
+
+def local_match(name, index):
+    """Exact (ignoring case/punctuation) or a close spelling match. Returns (key, how)."""
+    n = norm(name)
+    for key, label in index:
+        if norm(label) == n or norm(key) == n:
+            return key, 'exact'
+    labels = {norm(label): key for key, label in index}
+    close = difflib.get_close_matches(n, list(labels), n=1, cutoff=0.82)
+    if close:
+        return labels[close[0]], 'similar'
+    return None, None
+
+
+# ---------- AI ----------
+def ai_available():
+    return bool(AI_API_KEY)
+
+
+def ai_json(task, payload):
+    """Ask the AI model for a JSON answer. Raises Problem with a friendly message."""
+    if not AI_API_KEY:
+        raise Problem('AI is not set up. Add a free AI_API_KEY in Railway Variables.', 400)
+    models = [AI_STATE['model']] if AI_STATE['model'] else AI_MODELS
+    last = 'no model available'
+    for model in models:
+        body = json.dumps({
+            'model': model,
+            'temperature': 0,
+            'response_format': {'type': 'json_object'},
+            'messages': [
+                {'role': 'system', 'content': 'You help a small paint-by-number kit warehouse read stock spreadsheets. '
+                 'Reply with JSON only. Never invent data that is not in the input.'},
+                {'role': 'user', 'content': task + '\n\nINPUT:\n' + json.dumps(payload, ensure_ascii=False)},
+            ],
+        }).encode()
+        req = urllib.request.Request(AI_BASE_URL + 'chat/completions', body, method='POST', headers={
+            'Content-Type': 'application/json', 'Authorization': 'Bearer ' + AI_API_KEY})
+        try:
+            with urllib.request.urlopen(req, timeout=45) as res:
+                data = json.loads(res.read())
+        except urllib.error.HTTPError as e:
+            last = f'{e.code}'
+            if e.code in (400, 404) and len(models) > 1:
+                continue
+            if e.code == 429:
+                raise Problem('The free AI limit was reached. Try again in a minute, or match the columns yourself.', 429)
+            if e.code in (401, 403):
+                raise Problem('The AI key was refused. Check AI_API_KEY in Railway Variables.', 502)
+            raise Problem(f'The AI service returned an error ({e.code}). You can still match the columns yourself.', 502)
+        except (urllib.error.URLError, TimeoutError, OSError):
+            raise Problem('Could not reach the AI service. You can still match the columns yourself.', 502)
+        try:
+            text = data['choices'][0]['message']['content'] or ''
+            text = re.sub(r'^```(?:json)?|```$', '', text.strip(), flags=re.M).strip()
+            AI_STATE['model'] = model
+            return json.loads(text)
+        except (KeyError, IndexError, TypeError, ValueError):
+            raise Problem('The AI gave an answer that could not be read. Try again or match the columns yourself.', 502)
+    raise Problem(f'No AI model worked (last error {last}). Set AI_MODEL in Railway Variables.', 502)
+
+
+def ai_map_columns(sheets):
+    base = inspect_upload(sheets)
+    payload = {
+        'fields_for_parts': {k: v for k, v in PART_COLUMNS},
+        'fields_for_designs': {k: v for k, v in DESIGN_COLUMNS},
+        'sheets': [{'sheet': name, 'first_rows': [[cell_text(c) for c in r][:30] for r in rows[:12]]}
+                   for name, rows in sheets.items()],
+    }
+    task = ('For each sheet decide: kind = "parts" (raw materials / packing items with stock quantities), '
+            '"designs" (finished paint-by-number kits by SKU with packed stock) or "skip"; header_row = the 1-based '
+            'row number that holds the column headings; columns = object mapping 0-based column index (as a string) '
+            'to one field key from the matching field list. Leave out columns that fit no field. '
+            'Return {"sheets":[{"sheet":..., "kind":..., "header_row":..., "columns":{...}}]}.')
+    answer = ai_json(task, payload)
+    by_name = {s.get('sheet'): s for s in (answer.get('sheets') or []) if isinstance(s, dict)}
+    for b in base:
+        a = by_name.get(b['sheet'])
+        rows = sheets[b['sheet']]
+        if a and a.get('kind') in ('parts', 'designs', 'skip'):
+            kind = a['kind']
+            try:
+                h = int(a.get('header_row'))
+                h = h if 1 <= h <= min(len(rows), 30) else b['header_row']
+            except (TypeError, ValueError):
+                h = b['header_row']
+            cols = clean_mapping(kind, a.get('columns') or {}) if kind != 'skip' else {}
+            if h:
+                headers = [cell_text(c) for c in rows[h - 1]]
+                b.update({'kind': kind, 'header_row': h, 'headers': headers,
+                          'samples': [[cell_text(c) for c in r][:len(headers)] for r in rows[h:h + 5]],
+                          'columns': {str(k): v for k, v in cols.items() if k < len(headers)},
+                          'rows': max(0, len(rows) - h)})
+        b['ai'] = bool(a)
+    return base
+
+
+def ai_match_names(kind, names, index):
+    """Ask the AI to match free-text item names to known codes. Cached so preview and save agree."""
+    names = sorted(set(names))[:150]
+    if not names:
+        return {}
+    key = _hashlib.sha256(json.dumps([kind, names, index]).encode()).hexdigest()
+    if key in AI_NAME_CACHE:
+        return AI_NAME_CACHE[key]
+    task = ('Match each name in "names" to the one catalogue entry it clearly refers to, using the catalogue '
+            '"key". If you are not confident, use null. Return {"matches": {"<name>": "<key or null>"}}.')
+    answer = ai_json(task, {'names': names, 'catalogue': [{'key': k, 'name': n} for k, n in index]})
+    valid = {k for k, _ in index}
+    matches = {n: v for n, v in (answer.get('matches') or {}).items() if n in names and v in valid}
+    if len(AI_NAME_CACHE) > 50:
+        AI_NAME_CACHE.clear()
+    AI_NAME_CACHE[key] = matches
+    return matches
+
+
+def resolve_names(conn, tables, use_ai):
+    """Fill in code/sku for rows that only have a name. Adds a note saying how it was matched."""
+    notes = {}
+    for t in tables:
+        key_field = 'sku' if t['kind'] == 'designs' else 'code'
+        index = name_index(conn, t['kind'])
+        unmatched = []
+        for line, rec in t['records']:
+            if rec.get(key_field) or not rec.get('name'):
+                continue
+            key, how = local_match(rec['name'], index)
+            if key:
+                rec[key_field] = key
+                rec['_given_name'] = rec.pop('name')   # matched by name: never rename the item
+                if how != 'exact':
+                    notes[(t['sheet'], line)] = f'matched “{rec["_given_name"]}” by similar name → {key}'
+            else:
+                unmatched.append(rec['name'])
+        if unmatched and use_ai and ai_available():
+            matches = ai_match_names(t['kind'], unmatched, index)
+            for line, rec in t['records']:
+                if not rec.get(key_field) and rec.get('name') in matches:
+                    rec[key_field] = matches[rec['name']]
+                    notes[(t['sheet'], line)] = f'AI matched “{rec["name"]}” → {rec[key_field]}'
+                    rec['_given_name'] = rec.pop('name')
+        for line, rec in t['records']:
+            if not rec.get(key_field):
+                rec['_unmatched'] = True
+    return notes
+
+
+def decode_upload(body):
     filename = str(body.get('filename') or '').strip()
     lower = filename.lower()
     try:
@@ -1135,8 +1433,40 @@ def bulk_import(body, apply):
         raise Problem('That file is over 5 MB. Split it into smaller files.')
     if lower.endswith('.xls'):
         raise Problem("Old .xls files aren't supported. In Excel choose File → Save As → Excel Workbook (.xlsx).")
-    sheets = read_csv(data) if lower.endswith('.csv') else read_xlsx(data)
-    tables = find_tables(sheets)
+    return filename, (read_csv(data) if lower.endswith('.csv') else read_xlsx(data))
+
+
+def inspect_import(body):
+    _, sheets = decode_upload(body)
+    hr = body.get('header_rows') if isinstance(body.get('header_rows'), dict) else None
+    return {'sheets': inspect_upload(sheets, hr), 'ai': ai_available(),
+            'fields': {k: [{'key': f, 'label': l} for f, l in cols] for k, cols in
+                       (('parts', PART_COLUMNS), ('designs', DESIGN_COLUMNS))}}
+
+
+def ai_map_import(body):
+    _, sheets = decode_upload(body)
+    return {'sheets': ai_map_columns(sheets)}
+
+
+def bulk_import(body, apply):
+    """Preview (apply=False) or save (apply=True) an uploaded stock sheet.
+    The preview runs the real changes inside a transaction and rolls back,
+    so what you see is exactly what Save will do."""
+    mode = body.get('mode')
+    if mode not in ('set', 'add'):
+        raise Problem('Choose whether the numbers are a stock count or stock received.')
+    filename, sheets = decode_upload(body)
+    mapping = body.get('mapping')
+    if mapping is not None and not isinstance(mapping, list):
+        raise Problem('Invalid column matching.')
+    tables = tables_from_mapping(sheets, mapping) if mapping else auto_tables(sheets)
+    # Match name-only rows to codes before locking the database (AI calls can take a few seconds).
+    rconn = sqlite3.connect(str(DB)); rconn.row_factory = sqlite3.Row
+    try:
+        notes = resolve_names(rconn, tables, bool(body.get('ai_names')))
+    finally:
+        rconn.close()
     results, counts = [], {'new': 0, 'update': 0, 'same': 0, 'error': 0}
     with LOCK:
         conn = sqlite3.connect(str(DB), timeout=10, isolation_level=None)
@@ -1149,7 +1479,14 @@ def bulk_import(body, apply):
                 for line, rec in t['records']:
                     conn.execute('SAVEPOINT row')
                     try:
+                        if rec.get('_unmatched'):
+                            what = 'design' if t['kind'] == 'designs' else 'part'
+                            raise Problem(f'No {what} called “{rec.get("name")}”. Add a '
+                                          + ('SKU' if what == 'design' else 'Part code')
+                                          + f' column to create it as a new {what}, or fix the name.')
                         key, name, action, changes = handler(conn, rec, mode)
+                        if (t['sheet'], line) in notes and action != 'same':
+                            changes = [notes[(t['sheet'], line)]] + changes
                         conn.execute('RELEASE row')
                         results.append({'sheet': t['sheet'], 'kind': t['kind'], 'line': line, 'key': key,
                                         'name': name, 'action': action, 'changes': changes})
@@ -1283,6 +1620,8 @@ def route(method,path,body):
     if path=='/api/convert': return convert_component(body)
     if path=='/api/suppliers': return create_supplier(body)
     if path=='/api/pack-batch': return pack_batch(body)
+    if path=='/api/import/inspect': return inspect_import(body)
+    if path=='/api/import/ai-map': return ai_map_import(body)
     if path=='/api/import/preview': return bulk_import(body, False)
     if path=='/api/import/apply': return bulk_import(body, True)
     m=re.fullmatch(r'/api/kits/(\d+)/(recipe|confirm-recipe|pack|handover|count)',path)

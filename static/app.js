@@ -6,7 +6,8 @@ let PACK_MODE = 'pack';           // 'pack' = packed (uses parts) | 'handover' =
 let PACK_QTY = {};                // kit id -> number typed on Pack orders page
 let REORDER_FILTER = 'low';
 let TOAST_TIMEOUT;
-let UPLOAD = {file: null, name: '', data: '', mode: 'set', preview: null, busy: false, showSame: false, error: ''};
+const UPLOAD_BLANK = {file: null, name: '', data: '', mode: 'set', preview: null, busy: '', showSame: false, error: '', sheets: null, fields: null, ai: false, aiNames: true, step: 'map'};
+let UPLOAD = {...UPLOAD_BLANK};
 
 const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => Array.from(root.querySelectorAll(s));
@@ -278,34 +279,63 @@ function renderReorder() {
 
 
 /* ---------- Bulk upload ---------- */
+function mappingPayload() {
+  return (UPLOAD.sheets || []).filter(x => x.kind !== 'skip').map(x => ({sheet: x.sheet, kind: x.kind, header_row: x.header_row, columns: x.columns}));
+}
+function renderMapping() {
+  const u = UPLOAD;
+  const kindSel = (sh, i) => `<select class="select inline" data-map="kind" data-sheet="${i}">${[['parts', 'Parts stock'], ['designs', 'Designs (packed kits)'], ['skip', 'Don’t import']].map(([v, l]) => `<option value="${v}" ${sh.kind === v ? 'selected' : ''}>${l}</option>`).join('')}</select>`;
+  const rowSel = (sh, i) => `<select class="select inline" data-map="header" data-sheet="${i}">${Array.from({length: Math.min(15, Math.max(sh.rows + (sh.header_row || 0), 1))}, (_, n) => n + 1).map(n => `<option value="${n}" ${sh.header_row === n ? 'selected' : ''}>Row ${n}</option>`).join('')}</select>`;
+  const sheetsHtml = u.sheets.map((sh, i) => {
+    const fields = sh.kind === 'skip' ? [] : u.fields[sh.kind];
+    const cols = sh.headers.map((h, c) => {
+      const current = sh.columns[String(c)] || '';
+      const samples = sh.samples.map(r => r[c]).filter(Boolean).slice(0, 3);
+      return `<tr class="${current ? 'mapped' : ''}"><td><span class="row-title">${esc(h || 'Column ' + (c + 1))}</span><span class="row-sub">${samples.length ? samples.map(esc).join(' · ') : '<span class="muted">empty</span>'}</span></td><td class="arrow">→</td>
+        <td><select class="select" data-map="col" data-sheet="${i}" data-col="${c}" ${sh.kind === 'skip' ? 'disabled' : ''}><option value="">Ignore this column</option>${fields.map(f => `<option value="${f.key}" ${current === f.key ? 'selected' : ''}>${esc(f.label)}</option>`).join('')}</select></td></tr>`;
+    }).join('');
+    return `<section class="panel sheet-map ${sh.kind === 'skip' ? 'skipped' : ''}">
+      <div class="panel-head"><div><h2>Sheet “${esc(sh.sheet)}” ${sh.ai ? pill('Read by AI', 'neutral') : ''}</h2><p>${fmt(sh.rows)} rows below the headings</p></div><div class="toolbar-actions">${sh.headers.length ? rowSel(sh, i) : ''}${kindSel(sh, i)}</div></div>
+      ${sh.kind === 'skip' ? `<p class="muted">${sh.headers.length ? 'This sheet won’t be imported.' : 'No table found on this sheet.'}</p>` : `<div class="table-scroll"><table class="map-table"><thead><tr><th>Column in your file (examples)</th><th></th><th>What it is in the app</th></tr></thead><tbody>${cols}</tbody></table></div>`}
+    </section>`;
+  }).join('');
+  const usable = mappingPayload().length;
+  return `<section class="panel ai-bar"><div><h2>Check what each column means</h2><p class="muted">We guessed from the headings. Change anything that’s wrong — only matched columns are used.</p></div>
+      <div class="toolbar-actions">${u.ai ? `<button class="btn btn-secondary" data-action="upload-ai" ${u.busy ? 'disabled' : ''}>✦ Let AI read it</button>` : `<span class="muted small-note">AI help is off — add a free <b>AI_API_KEY</b> in Railway to turn it on.</span>`}</div></section>
+    ${sheetsHtml}
+    ${u.ai ? `<label class="check block"><input type="checkbox" data-action="upload-ainames" ${u.aiNames ? 'checked' : ''}> Use AI to match item names that are spelled differently from the app</label>` : ''}
+    <div class="pack-bar"><div class="summary">${usable ? `<b>${plural(usable, 'sheet')}</b> ready to check` : 'Choose at least one sheet to import'}</div><div class="toolbar-actions"><button class="btn btn-small btn-ghost" data-action="upload-reset">Cancel</button><button class="btn" data-action="upload-preview" ${usable ? '' : 'disabled'}>Preview changes →</button></div></div>`;
+}
+function renderPreview() {
+  const u = UPLOAD, p = u.preview, c = p.counts;
+  const rows = p.results.filter(r => u.showSame || r.action !== 'same');
+  const tag = r => r.action === 'new' ? pill('New', '') : r.action === 'update' ? pill('Change', 'warn') : r.action === 'error' ? pill('Error', 'bad') : pill('No change', 'neutral');
+  const body = rows.map(r => `<tr class="${r.action === 'error' ? 'err' : ''}"><td class="mono">${esc(r.sheet)} · row ${r.line}</td><td><span class="row-title">${esc(r.name || r.key)}</span><span class="mono">${esc(r.key)}</span></td><td>${tag(r)}</td><td>${r.action === 'error' ? `<span class="qty-bad">${esc(r.error)}</span>` : esc((r.changes || []).join(' · ') || '—')}</td></tr>`).join('');
+  const ready = c.new + c.update;
+  return `${p.applied ? `<div class="notice ok"><b>Saved.</b> ${plural(c.new, 'new item')} added and ${plural(c.update, 'item')} updated${c.error ? `; ${plural(c.error, 'row')} skipped because of errors` : ''}.</div>` : ''}
+    <div class="stats small">
+      <div class="stat"><div class="label">New</div><div class="value">${fmt(c.new)}</div></div>
+      <div class="stat"><div class="label">Changes</div><div class="value">${fmt(c.update)}</div></div>
+      <div class="stat"><div class="label">No change</div><div class="value">${fmt(c.same)}</div></div>
+      <div class="stat ${c.error ? 'bad' : ''}"><div class="label">Errors</div><div class="value">${fmt(c.error)}</div></div>
+    </div>
+    <section class="panel">${panelHead(p.applied ? 'What was saved' : 'Preview — nothing is saved yet', `${esc(u.name)} · ${p.tables.map(t => `${esc(t.sheet)} (${t.rows} rows, ${t.kind})`).join(', ')}`, `<label class="check"><input type="checkbox" data-action="upload-same" ${u.showSame ? 'checked' : ''}> Show unchanged rows</label>`)}
+      ${rows.length ? `<div class="table-scroll"><table><thead><tr><th>Where</th><th>Item</th><th>Result</th><th>Details</th></tr></thead><tbody>${body}</tbody></table></div>` : empty('Nothing to change', 'Every row already matches what’s in the app.')}
+    </section>
+    ${p.applied ? `<div class="form-buttons"><button class="btn btn-secondary" data-action="upload-reset">Upload another file</button><button class="btn btn-primary" data-tab="components">See parts stock</button></div>`
+      : `<div class="pack-bar"><div class="summary"><b>${plural(ready, 'row')}</b> will be saved as <b>${u.mode === 'add' ? 'stock received (added)' : 'a stock count (replaced)'}</b>${c.error ? ` · ${c.error} with errors will be skipped` : ''}</div><div class="toolbar-actions"><button class="btn btn-small btn-ghost" data-action="upload-back">← Columns</button><button class="btn" data-action="upload-apply" ${ready ? '' : 'disabled'}>Save to stock</button></div></div>`}`;
+}
 function renderUpload() {
-  const u = UPLOAD, p = u.preview;
+  const u = UPLOAD;
   const modeBtn = (m, label, hint) => `<button class="mode-card ${u.mode === m ? 'on' : ''}" data-action="upload-mode" data-mode="${m}" aria-pressed="${u.mode === m}"><b>${label}</b><span>${hint}</span></button>`;
-  let previewHtml = '';
-  if (u.busy) previewHtml = `<div class="loading">Reading ${esc(u.name)}…</div>`;
-  else if (u.error) previewHtml = `<div class="notice bad"><b>Couldn’t read this file.</b> ${esc(u.error)}</div>`;
-  else if (p) {
-    const c = p.counts;
-    const rows = p.results.filter(r => u.showSame || r.action !== 'same');
-    const tag = r => r.action === 'new' ? pill('New', '') : r.action === 'update' ? pill('Change', 'warn') : r.action === 'error' ? pill('Error', 'bad') : pill('No change', 'neutral');
-    const body = rows.map(r => `<tr class="${r.action === 'error' ? 'err' : ''}"><td class="mono">${esc(r.sheet)} · row ${r.line}</td><td><span class="row-title">${esc(r.name || r.key)}</span><span class="mono">${esc(r.key)}</span></td><td>${tag(r)}</td><td>${r.action === 'error' ? `<span class="qty-bad">${esc(r.error)}</span>` : esc((r.changes || []).join(' · ') || '—')}</td></tr>`).join('');
-    const ready = c.new + c.update;
-    previewHtml = `${p.applied ? `<div class="notice ok"><b>Saved.</b> ${plural(c.new, 'new item')} added and ${plural(c.update, 'item')} updated${c.error ? `; ${plural(c.error, 'row')} skipped because of errors` : ''}.</div>` : ''}
-      <div class="stats small">
-        <div class="stat"><div class="label">New</div><div class="value">${fmt(c.new)}</div></div>
-        <div class="stat"><div class="label">Changes</div><div class="value">${fmt(c.update)}</div></div>
-        <div class="stat"><div class="label">No change</div><div class="value">${fmt(c.same)}</div></div>
-        <div class="stat ${c.error ? 'bad' : ''}"><div class="label">Errors</div><div class="value">${fmt(c.error)}</div></div>
-      </div>
-      <section class="panel">${panelHead(p.applied ? 'What was saved' : 'Preview — nothing is saved yet', `${esc(u.name)} · ${p.tables.map(t => `${esc(t.sheet)} (${t.rows} rows, ${t.kind})`).join(', ')}`, `<label class="check"><input type="checkbox" data-action="upload-same" ${u.showSame ? 'checked' : ''}> Show unchanged rows</label>`)}
-        ${rows.length ? `<div class="table-scroll"><table><thead><tr><th>Where</th><th>Item</th><th>Result</th><th>Details</th></tr></thead><tbody>${body}</tbody></table></div>` : empty('Nothing to change', 'Every row already matches what’s in the app.')}
-      </section>
-      ${p.applied ? `<div class="form-buttons"><button class="btn btn-secondary" data-action="upload-reset">Upload another file</button><button class="btn btn-primary" data-tab="components">See parts stock</button></div>`
-        : `<div class="pack-bar"><div class="summary"><b>${plural(ready, 'row')}</b> will be saved as <b>${u.mode === 'add' ? 'stock received (added)' : 'a stock count (replaced)'}</b>${c.error ? ` · ${c.error} with errors will be skipped` : ''}</div><div class="toolbar-actions"><button class="btn btn-small btn-ghost" data-action="upload-reset">Cancel</button><button class="btn" data-action="upload-apply" ${ready ? '' : 'disabled'}>Save to stock</button></div></div>`}`;
-  }
+  let lower = '';
+  if (u.busy) lower = `<div class="loading">${esc(u.busy)}</div>`;
+  else if (u.error) lower = `<div class="notice bad"><b>Something went wrong.</b> ${esc(u.error)}</div>${u.sheets ? renderMapping() : ''}`;
+  else if (u.step === 'preview' && u.preview) lower = renderPreview();
+  else if (u.sheets) lower = renderMapping();
   return `<div class="upload-grid">
-    <section class="panel step"><span class="step-num">1</span><div><h2>Get the Excel sheet</h2><p class="muted">It has your current parts and designs, so you only change the numbers. You can also use your own sheet with a “Part code” or “SKU” column.</p>
-      <a class="btn btn-secondary" href="/api/export.xlsx" download>Download Excel ↓</a></div></section>
+    <section class="panel step"><span class="step-num">1</span><div><h2>Use any Excel sheet</h2><p class="muted">Upload your own sheet — you’ll confirm which column is what. Or start from ours, which already lists every part and design.</p>
+      <a class="btn btn-secondary" href="/api/export.xlsx" download>Download our sheet ↓</a></div></section>
     <section class="panel step"><span class="step-num">2</span><div><h2>What are the numbers?</h2><div class="mode-cards">${modeBtn('set', 'Stock count', 'Replace stock with these numbers')}${modeBtn('add', 'Stock received', 'Add these numbers to stock')}</div></div></section>
   </div>
   <label class="dropzone ${u.name ? 'has-file' : ''}" id="dropzone" for="upload-input">
@@ -315,28 +345,44 @@ function renderUpload() {
     <span class="muted">${u.name ? 'Drop another file or click to change it' : '.xlsx or .csv, up to 5 MB'}</span>
     <span class="btn btn-primary">${u.name ? 'Choose a different file' : 'Upload file'}</span>
   </label>
-  ${previewHtml}`;
+  ${lower}`;
 }
 function readUpload(file) {
   if (!file) return;
   if (!/\.(xlsx|csv)$/i.test(file.name)) { toast(/\.xls$/i.test(file.name) ? 'Old .xls files aren’t supported. In Excel use File → Save As → Excel Workbook (.xlsx).' : 'Please choose an Excel (.xlsx) or .csv file.', true); return; }
   if (file.size > 5 * 1024 * 1024) { toast('That file is over 5 MB.', true); return; }
   const reader = new FileReader();
-  reader.onload = () => { UPLOAD = {...UPLOAD, file, name: file.name, data: String(reader.result).split(',')[1] || '', preview: null, error: ''}; uploadPreview(); };
+  reader.onload = () => { UPLOAD = {...UPLOAD_BLANK, mode: UPLOAD.mode, file, name: file.name, data: String(reader.result).split(',')[1] || ''}; uploadInspect(); };
   reader.onerror = () => toast('Couldn’t read that file.', true);
   reader.readAsDataURL(file);
 }
-async function uploadPreview() {
-  if (!UPLOAD.data) { render(); return; }
-  UPLOAD.busy = true; UPLOAD.error = ''; render();
-  try { UPLOAD.preview = await request('/api/import/preview', {filename: UPLOAD.name, data: UPLOAD.data, mode: UPLOAD.mode}); }
-  catch (e) { UPLOAD.error = e.message; UPLOAD.preview = null; }
-  UPLOAD.busy = false; render();
+async function uploadCall(label, fn) {
+  UPLOAD.busy = label; UPLOAD.error = ''; render();
+  try { await fn(); } catch (e) { UPLOAD.error = e.message; }
+  UPLOAD.busy = ''; render();
+}
+function uploadInspect(headerRows) {
+  return uploadCall(`Reading ${UPLOAD.name}…`, async () => {
+    const r = await request('/api/import/inspect', {filename: UPLOAD.name, data: UPLOAD.data, header_rows: headerRows || {}});
+    UPLOAD.sheets = r.sheets; UPLOAD.fields = r.fields; UPLOAD.ai = r.ai; UPLOAD.step = 'map';
+  });
+}
+function uploadAiMap() {
+  return uploadCall('AI is reading your sheet… (this can take a few seconds)', async () => {
+    const r = await request('/api/import/ai-map', {filename: UPLOAD.name, data: UPLOAD.data});
+    UPLOAD.sheets = r.sheets; toast('AI filled in the columns. Please check them.');
+  });
+}
+function uploadPreview() {
+  return uploadCall(UPLOAD.aiNames && UPLOAD.ai ? 'Checking every row (AI is matching names)…' : 'Checking every row…', async () => {
+    UPLOAD.preview = await request('/api/import/preview', {filename: UPLOAD.name, data: UPLOAD.data, mode: UPLOAD.mode, mapping: mappingPayload(), ai_names: UPLOAD.ai && UPLOAD.aiNames});
+    UPLOAD.step = 'preview';
+  });
 }
 async function uploadApply(btn) {
   btn.disabled = true;
   try {
-    const r = await request('/api/import/apply', {filename: UPLOAD.name, data: UPLOAD.data, mode: UPLOAD.mode});
+    const r = await request('/api/import/apply', {filename: UPLOAD.name, data: UPLOAD.data, mode: UPLOAD.mode, mapping: mappingPayload(), ai_names: UPLOAD.ai && UPLOAD.aiNames});
     UPLOAD.preview = r; UPLOAD.data = '';
     await load();
     toast(`Saved: ${r.counts.new} new, ${r.counts.update} updated.`);
@@ -519,8 +565,11 @@ async function runAction(action, id, el) {
       const inp = $(`.pack-input[data-id="${id}"]`); if (inp) inp.value = next || '';
       updatePackSummary(); break;
     }
-    case 'upload-mode': UPLOAD.mode = el.dataset.mode; if (UPLOAD.data) await uploadPreview(); else render(); break;
-    case 'upload-reset': UPLOAD = {file: null, name: '', data: '', mode: UPLOAD.mode, preview: null, busy: false, showSame: false, error: ''}; render(); break;
+    case 'upload-mode': UPLOAD.mode = el.dataset.mode; if (UPLOAD.data && UPLOAD.step === 'preview') await uploadPreview(); else render(); break;
+    case 'upload-reset': UPLOAD = {...UPLOAD_BLANK, mode: UPLOAD.mode}; render(); break;
+    case 'upload-ai': await uploadAiMap(); break;
+    case 'upload-preview': await uploadPreview(); break;
+    case 'upload-back': UPLOAD.step = 'map'; UPLOAD.preview = null; render(); break;
     case 'upload-apply': await uploadApply(el); break;
     case 'unlock': unlockKit(kitById(id)); break;
     case 'unlock-confirm':
@@ -553,6 +602,26 @@ document.addEventListener('keydown', ev => { if (ev.key === 'Escape') closeModal
 document.addEventListener('change', ev => {
   if (ev.target.id === 'upload-input') { readUpload(ev.target.files[0]); ev.target.value = ''; }
   if (ev.target.dataset.action === 'upload-same') { UPLOAD.showSame = ev.target.checked; render(); }
+  if (ev.target.dataset.action === 'upload-ainames') UPLOAD.aiNames = ev.target.checked;
+  const m = ev.target.dataset.map;
+  if (m && UPLOAD.sheets) {
+    const sh = UPLOAD.sheets[Number(ev.target.dataset.sheet)];
+    if (m === 'kind') {
+      const swap = {parts: {sku: 'code', packed_qty: 'qty'}, designs: {code: 'sku', qty: 'packed_qty'}}[ev.target.value] || {};
+      const allowed = new Set((UPLOAD.fields[ev.target.value] || []).map(f => f.key));
+      const cols = {};
+      for (const [c, f] of Object.entries(sh.columns)) { const nf = swap[f] || f; if (allowed.has(nf)) cols[c] = nf; }
+      sh.kind = ev.target.value; sh.columns = cols; render();
+    } else if (m === 'header') {
+      const hr = {}; UPLOAD.sheets.forEach(x => { if (x.header_row) hr[x.sheet] = x.header_row; }); hr[sh.sheet] = Number(ev.target.value);
+      uploadInspect(hr);
+    } else if (m === 'col') {
+      const col = ev.target.dataset.col, val = ev.target.value;
+      for (const [c, f] of Object.entries(sh.columns)) if (f === val && c !== col) delete sh.columns[c];
+      if (val) sh.columns[col] = val; else delete sh.columns[col];
+      render();
+    }
+  }
 });
 let dragDepth = 0;
 document.addEventListener('dragenter', ev => { if (TAB !== 'upload' || !ev.dataTransfer?.types?.includes('Files')) return; ev.preventDefault(); dragDepth++; $('#dropzone')?.classList.add('drag'); });

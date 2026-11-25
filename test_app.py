@@ -255,6 +255,50 @@ class WarehouseSmokeTests(unittest.TestCase):
         self.assertTrue(c['HOOK']['low_stock'])
         self.post('/api/pack-batch',{'items':[]},400)
 
+    def test_excel_bulk_upload(self):
+        import base64, importlib.util, zipfile, io
+        spec=importlib.util.spec_from_file_location('aurva_app',APP)
+        appmod=importlib.util.module_from_spec(spec); spec.loader.exec_module(appmod)
+        raw=urlopen(URL+'/api/export.xlsx',timeout=5).read()
+        names=zipfile.ZipFile(io.BytesIO(raw)).namelist()
+        self.assertIn('xl/worksheets/sheet1.xml',names)
+        enc=lambda b: base64.b64encode(b).decode()
+        # Re-uploading the downloaded file unchanged changes nothing.
+        same=self.post('/api/import/preview',{'filename':'aurva.xlsx','data':enc(raw),'mode':'set'})
+        self.assertEqual(same['counts']['new']+same['counts']['update']+same['counts']['error'],0)
+        self.assertGreater(same['counts']['same'],20)
+        comps={c['code']:c for c in self.get('/api/state')['components']}
+        hook_before=comps['HOOK']['qty']
+        book=appmod.xlsx_bytes([('Parts',['Part code','Part name','Unit','Stock quantity','Supplier','Price per unit (Rs)','Reorder link'],
+            [['HOOK','','',40,'Hook shop',2.5,'https://example.com/hooks'],
+             ['NEW-GLUE','Glue stick','pcs',12,'','',''],
+             ['BAD-ROW','','',5,'','',''],
+             ['ZIPLOCK','','kg',3,'','','']],[10]*7),
+            ('Designs',['SKU','Packed stock'],[['PN0A4-91-0003',14]],[10,10])])
+        prev=self.post('/api/import/preview',{'filename':'stock.xlsx','data':enc(book),'mode':'set'})
+        self.assertEqual(prev['counts'],{'new':1,'update':2,'same':0,'error':2})
+        # Preview must not save anything.
+        self.assertEqual({c['code']:c for c in self.get('/api/state')['components']}['HOOK']['qty'],hook_before)
+        done=self.post('/api/import/apply',{'filename':'stock.xlsx','data':enc(book),'mode':'set'})
+        self.assertTrue(done['applied'])
+        st=self.get('/api/state')
+        c={x['code']:x for x in st['components']}
+        self.assertEqual(c['HOOK']['qty'],40)
+        self.assertEqual(c['NEW-GLUE']['qty'],12)
+        self.assertNotIn('BAD-ROW',c)
+        self.assertTrue(any(s['name']=='Hook shop' and s['url']=='https://example.com/hooks' for s in st['suppliers']))
+        self.assertEqual(next(k for k in st['kits'] if k['sku']=='PN0A4-91-0003')['packed_qty'],14)
+        # "Stock received" adds, and CSV works too.
+        csv_data='Part code,Stock quantity\nHOOK,5\nNEW-GLUE,3\n'.encode()
+        self.post('/api/import/apply',{'filename':'in.csv','data':enc(csv_data),'mode':'add'})
+        c={x['code']:x for x in self.get('/api/state')['components']}
+        self.assertEqual(c['HOOK']['qty'],45)
+        self.assertEqual(c['NEW-GLUE']['qty'],15)
+        bad=self.post('/api/import/preview',{'filename':'x.xlsx','data':enc(b'not a zip'),'mode':'set'},400)
+        self.assertIn('Excel',bad['error'])
+        nohead=self.post('/api/import/preview',{'filename':'x.csv','data':enc(b'a,b\n1,2\n'),'mode':'set'},400)
+        self.assertIn('Part code',nohead['error'])
+
 
 class LoginTests(unittest.TestCase):
     """Hosted mode: pages need a signed-in session cookie."""

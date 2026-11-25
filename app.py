@@ -17,6 +17,11 @@ import re
 import sqlite3
 import secrets
 import threading
+import io
+import csv
+import zipfile
+import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape as xml_escape
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -827,6 +832,445 @@ def update_supplier(sid,body):
         return {'ok':True}
 
 
+# ---------------------------------------------------------------------------
+# Excel bulk upload / download (stdlib only: .xlsx is a zip of XML files)
+# ---------------------------------------------------------------------------
+IMPORT_MAX_BYTES = 5 * 1024 * 1024
+NS = {'m': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+REL_NS = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id'
+
+PART_COLUMNS = [
+    ('code', 'Part code'), ('name', 'Part name'), ('unit', 'Unit'),
+    ('qty', 'Stock quantity'), ('min_qty', 'Alert minimum'),
+    ('purchase_multiplier', 'Units per purchase'), ('purchase_unit', 'Purchase unit'),
+    ('supplier', 'Supplier'), ('price', 'Price per unit (Rs)'), ('url', 'Reorder link'),
+]
+DESIGN_COLUMNS = [
+    ('sku', 'SKU'), ('name', 'Design name'), ('size', 'Size'),
+    ('packed_qty', 'Packed stock'), ('paint_colours', 'Paint colours'),
+    ('subtitle', 'Subtitle'), ('barcode', 'Barcode'), ('mrp', 'MRP'), ('selling_price', 'Selling price'),
+]
+HEADER_ALIASES = {
+    'code': 'code', 'partcode': 'code', 'componentcode': 'code', 'itemcode': 'code',
+    'partname': 'name', 'componentname': 'name', 'item': 'name', 'itemname': 'name',
+    'designname': 'name', 'productname': 'name', 'name': 'name', 'artwork': 'name',
+    'unit': 'unit', 'units': 'unit',
+    'stockquantity': 'qty', 'quantity': 'qty', 'qty': 'qty', 'stock': 'qty', 'instock': 'qty',
+    'count': 'qty', 'received': 'qty',
+    'alertminimum': 'min_qty', 'minimum': 'min_qty', 'minqty': 'min_qty', 'alertlevel': 'min_qty', 'reorderlevel': 'min_qty',
+    'unitsperpurchase': 'purchase_multiplier', 'purchaseunit': 'purchase_unit',
+    'supplier': 'supplier', 'suppliername': 'supplier', 'vendor': 'supplier',
+    'priceperunitrs': 'price', 'price': 'price', 'priceperunit': 'price', 'unitprice': 'price',
+    'reorderlink': 'url', 'link': 'url', 'url': 'url', 'productlink': 'url',
+    'sku': 'sku', 'size': 'size', 'packedstock': 'packed_qty', 'packed': 'packed_qty', 'packedkits': 'packed_qty',
+    'paintcolours': 'paint_colours', 'paintcolors': 'paint_colours', 'colours': 'paint_colours',
+    'subtitle': 'subtitle', 'barcode': 'barcode', 'mrp': 'mrp', 'sellingprice': 'selling_price',
+}
+UNITS = ('pcs', 'set', 'strip', 'tube', 'cm', 'ml', 'g')
+
+
+def header_key(text):
+    return HEADER_ALIASES.get(re.sub(r'[^a-z]', '', str(text or '').lower()))
+
+
+def col_index(ref):
+    letters = re.match(r'[A-Z]+', ref or '')
+    n = 0
+    for ch in (letters.group(0) if letters else 'A'):
+        n = n * 26 + ord(ch) - 64
+    return n - 1
+
+
+def cell_text(value):
+    if value is None:
+        return ''
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def read_xlsx(data):
+    """Return {sheet name: [rows]} with each row a list of cell values."""
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        raise Problem('That file is not a valid Excel (.xlsx) file. Save it as "Excel Workbook" and try again.')
+    if sum(i.file_size for i in zf.infolist()) > 60 * 1024 * 1024:
+        raise Problem('The spreadsheet is too large.')
+
+    def xml(name):
+        raw = zf.read(name)
+        if b'<!DOCTYPE' in raw[:4000] or b'<!ENTITY' in raw:
+            raise Problem('The spreadsheet contains unsupported content.')
+        return ET.fromstring(raw)
+
+    names = set(zf.namelist())
+    if 'xl/workbook.xml' not in names:
+        raise Problem('That file is not a valid Excel (.xlsx) file.')
+    shared = []
+    if 'xl/sharedStrings.xml' in names:
+        for si in xml('xl/sharedStrings.xml').findall('m:si', NS):
+            shared.append(''.join(t.text or '' for t in si.iter('{%s}t' % NS['m'])))
+    rels = {}
+    if 'xl/_rels/workbook.xml.rels' in names:
+        for r in xml('xl/_rels/workbook.xml.rels'):
+            target = r.get('Target', '')
+            target = target.lstrip('/') if target.startswith('/') else 'xl/' + target
+            rels[r.get('Id')] = target
+    sheets = {}
+    for sh in xml('xl/workbook.xml').iter('{%s}sheet' % NS['m']):
+        path = rels.get(sh.get(REL_NS))
+        if not path or path not in names:
+            continue
+        rows = []
+        for row in xml(path).iter('{%s}row' % NS['m']):
+            values = {}
+            for c in row.findall('m:c', NS):
+                kind = c.get('t')
+                v = c.find('m:v', NS)
+                if kind == 'inlineStr':
+                    val = ''.join(t.text or '' for t in c.iter('{%s}t' % NS['m']))
+                elif v is None or v.text is None:
+                    continue
+                elif kind == 's':
+                    idx = int(v.text)
+                    val = shared[idx] if idx < len(shared) else ''
+                elif kind in ('str', 'e'):
+                    val = v.text
+                elif kind == 'b':
+                    val = v.text == '1'
+                else:
+                    try:
+                        val = float(v.text)
+                    except ValueError:
+                        val = v.text
+                values[col_index(c.get('r'))] = val
+            if values:
+                rows.append([values.get(i) for i in range(max(values) + 1)])
+            if len(rows) > 5000:
+                raise Problem('Please upload 5000 rows or fewer at a time.')
+        sheets[sh.get('name', 'Sheet')] = rows
+    return sheets
+
+
+def read_csv(data):
+    text = data.decode('utf-8-sig', errors='replace')
+    rows = list(csv.reader(io.StringIO(text)))
+    if len(rows) > 5000:
+        raise Problem('Please upload 5000 rows or fewer at a time.')
+    return {'CSV': rows}
+
+
+def find_tables(sheets):
+    """Find a header row in each sheet and decide whether it lists parts or designs."""
+    tables = []
+    for name, rows in sheets.items():
+        for i, row in enumerate(rows[:10]):
+            keys = [header_key(c) for c in row]
+            if 'code' in keys or 'sku' in keys:
+                kind = 'designs' if 'sku' in keys else 'parts'
+                records = []
+                for n, r in enumerate(rows[i + 1:], start=i + 2):
+                    rec = {}
+                    for k, v in zip(keys, r):
+                        if k and cell_text(v) != '':
+                            rec.setdefault(k, cell_text(v))
+                    if rec:
+                        records.append((n, rec))
+                tables.append({'sheet': name, 'kind': kind, 'records': records})
+                break
+    if not tables:
+        raise Problem('No stock table found. The first row needs column names, including "Part code" (for parts) '
+                      'or "SKU" (for designs). Download the Excel template to see the layout.')
+    return tables
+
+
+def fmt_num(n):
+    return f'{n:g}'
+
+
+def import_part(conn, rec, mode):
+    code = clean(rec.get('code'), 'Part code', 80)
+    row = conn.execute('SELECT * FROM components WHERE code=?', (code,)).fetchone()
+    changes = []
+    if row is None:
+        name = clean(rec.get('name'), 'Part name (needed for a new part)')
+        unit = (rec.get('unit') or 'pcs').strip().lower()
+        if unit not in UNITS:
+            raise Problem('Unit must be one of ' + ', '.join(UNITS) + '.')
+        qty = number(rec.get('qty', 0), 'Stock quantity', True)
+        minq = number(rec.get('min_qty', 0), 'Alert minimum', True)
+        mult = number(rec.get('purchase_multiplier', 1), 'Units per purchase')
+        punit = (rec.get('purchase_unit') or unit)[:80]
+        cid = conn.execute('INSERT INTO components (code,name,unit,qty,min_qty,purchase_multiplier,purchase_unit) '
+                           'VALUES (?,?,?,?,?,?,?)', (code, name, unit, qty, minq, mult, punit)).lastrowid
+        changes.append(f'new part, stock {fmt_num(qty)} {unit}')
+        audit(conn, 'Bulk upload', f'{code}: new part, opening stock {fmt_num(qty)} {unit}')
+        action, shown_name = 'new', name
+    else:
+        cid, action, shown_name = row['id'], 'update', row['name']
+        if 'unit' in rec and rec['unit'].strip().lower() != row['unit']:
+            raise Problem(f"Unit can't be changed by upload (this part is counted in {row['unit']}).")
+        if 'qty' in rec:
+            amount = number(rec['qty'], 'Stock quantity', True)
+            new = round(row['qty'] + amount, 4) if mode == 'add' else amount
+            if new != row['qty']:
+                changes.append(f'stock {fmt_num(row["qty"])} → {fmt_num(new)} {row["unit"]}')
+                conn.execute('UPDATE components SET qty=? WHERE id=?', (new, cid))
+                audit(conn, 'Bulk upload', f'{code}: stock {fmt_num(row["qty"])} → {fmt_num(new)} {row["unit"]}'
+                      + (' (received)' if mode == 'add' else ' (count)'))
+        if rec.get('name') and rec['name'] != row['name']:
+            conn.execute('UPDATE components SET name=? WHERE id=?', (clean(rec['name'], 'Part name'), cid))
+            changes.append('renamed')
+        for key, label in (('min_qty', 'alert minimum'), ('purchase_multiplier', 'units per purchase')):
+            if key in rec:
+                val = number(rec[key], label.capitalize(), key == 'min_qty')
+                if val != row[key]:
+                    conn.execute(f'UPDATE components SET {key}=? WHERE id=?', (val, cid))
+                    changes.append(f'{label} {fmt_num(val)}')
+        if rec.get('purchase_unit') and rec['purchase_unit'] != row['purchase_unit']:
+            conn.execute('UPDATE components SET purchase_unit=? WHERE id=?', (rec['purchase_unit'][:80], cid))
+            changes.append('purchase unit')
+    if rec.get('supplier'):
+        sname = clean(rec['supplier'], 'Supplier', 160)
+        existing = conn.execute('SELECT * FROM suppliers WHERE component_id=? AND name=? COLLATE NOCASE',
+                                (cid, sname)).fetchone()
+        if existing is None:
+            price = number(rec.get('price'), 'Price per unit (needed for a new supplier)', True)
+            url = normal_url(rec.get('url'))
+            sid = conn.execute('INSERT INTO suppliers (component_id,name,url,price,updated_at) VALUES (?,?,?,?,?)',
+                               (cid, sname, url, price, now())).lastrowid
+            conn.execute('INSERT INTO supplier_price_history (supplier_id,price,changed_at) VALUES (?,?,?)',
+                         (sid, price, now()))
+            changes.append(f'reorder link added ({sname})')
+        else:
+            price = number(rec['price'], 'Price per unit', True) if 'price' in rec else existing['price']
+            url = normal_url(rec['url']) if 'url' in rec else existing['url']
+            if price != existing['price'] or url != existing['url']:
+                conn.execute('UPDATE suppliers SET url=?,price=?,updated_at=? WHERE id=?',
+                             (url, price, now(), existing['id']))
+                if price != existing['price']:
+                    conn.execute('INSERT INTO supplier_price_history (supplier_id,price,changed_at) VALUES (?,?,?)',
+                                 (existing['id'], price, now()))
+                    changes.append(f'{sname} price ₹{fmt_num(existing["price"])} → ₹{fmt_num(price)}')
+                else:
+                    changes.append(f'{sname} link updated')
+    elif rec.get('url') or rec.get('price'):
+        raise Problem('Add a Supplier name to save a price or reorder link.')
+    if action == 'update' and not changes:
+        action = 'same'
+    return code, shown_name, action, changes
+
+
+def import_design(conn, rec, mode):
+    sku = clean(rec.get('sku'), 'SKU', 80)
+    row = conn.execute('SELECT * FROM kits WHERE sku=?', (sku,)).fetchone()
+    changes = []
+    if row is None:
+        name = clean(rec.get('name'), 'Design name (needed for a new design)')
+        size = (rec.get('size') or '').strip().upper()
+        if size not in ('A5', 'A4', 'A3'):
+            raise Problem('Size must be A5, A4 or A3 for a new design.')
+        counted = 'packed_qty' in rec
+        packed = nonneg_int(rec['packed_qty'], 'Packed stock') if counted else 0
+        colours = paint_colour_count(rec.get('paint_colours'))
+        conn.execute('INSERT INTO kits (sku,name,size,packed_qty,stock_counted,subtitle,barcode,mrp,'
+                     'selling_price,paint_colours,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                     (sku, name, size, packed, int(counted), (rec.get('subtitle') or '')[:160],
+                      check_barcode(rec.get('barcode')), optional_price(rec.get('mrp'), 'MRP'),
+                      optional_price(rec.get('selling_price'), 'Selling price'), colours, now()))
+        audit(conn, 'Bulk upload', f'{sku}: new design {name} ({size}), packed stock '
+              + (str(packed) if counted else 'not counted'))
+        return sku, name, 'new', [f'new design, {packed if counted else "not counted"} packed']
+    if rec.get('size') and rec['size'].strip().upper() != row['size']:
+        raise Problem(f"Size can't be changed by upload (this design is {row['size']}).")
+    if 'packed_qty' in rec:
+        amount = nonneg_int(rec['packed_qty'], 'Packed stock')
+        new = row['packed_qty'] + amount if mode == 'add' else amount
+        if new != row['packed_qty'] or not row['stock_counted']:
+            conn.execute('UPDATE kits SET packed_qty=?, stock_counted=1 WHERE id=?', (new, row['id']))
+            before = row['packed_qty'] if row['stock_counted'] else 'not counted'
+            changes.append(f'packed {before} → {new}')
+            audit(conn, 'Bulk upload', f'{sku}: packed stock {before} → {new} (no parts deducted)')
+    if rec.get('name') and rec['name'] != row['name']:
+        conn.execute('UPDATE kits SET name=? WHERE id=?', (clean(rec['name'], 'Design name'), row['id']))
+        changes.append('renamed')
+    if 'paint_colours' in rec:
+        colours = paint_colour_count(rec['paint_colours'])
+        if colours != row['paint_colours']:
+            conn.execute('UPDATE kits SET paint_colours=? WHERE id=?', (colours, row['id']))
+            sync_paint_strip_recipe(conn, row['id'], colours)
+            changes.append(f'{colours} colours (recipe needs confirming again)')
+    for key, label in (('mrp', 'MRP'), ('selling_price', 'Selling price')):
+        if key in rec:
+            val = optional_price(rec[key], label)
+            if val != row[key]:
+                conn.execute(f'UPDATE kits SET {key}=? WHERE id=?', (val, row['id']))
+                changes.append(f'{label} ₹{fmt_num(val)}')
+    if rec.get('barcode') and rec['barcode'] != row['barcode']:
+        conn.execute('UPDATE kits SET barcode=? WHERE id=?', (check_barcode(rec['barcode']), row['id']))
+        changes.append('barcode')
+    if rec.get('subtitle') and rec['subtitle'] != row['subtitle']:
+        conn.execute('UPDATE kits SET subtitle=? WHERE id=?', (rec['subtitle'][:160], row['id']))
+        changes.append('subtitle')
+    return sku, row['name'], 'update' if changes else 'same', changes
+
+
+def bulk_import(body, apply):
+    """Preview (apply=False) or save (apply=True) an uploaded stock sheet.
+    The preview runs the real changes inside a transaction and rolls back,
+    so what you see is exactly what Save will do."""
+    mode = body.get('mode')
+    if mode not in ('set', 'add'):
+        raise Problem('Choose whether the numbers are a stock count or stock received.')
+    filename = str(body.get('filename') or '').strip()
+    lower = filename.lower()
+    try:
+        data = base64.b64decode(str(body.get('data') or ''), validate=True)
+    except (binascii.Error, ValueError):
+        raise Problem('The file could not be read. Please choose it again.')
+    if not data:
+        raise Problem('Choose an Excel file to upload.')
+    if len(data) > IMPORT_MAX_BYTES:
+        raise Problem('That file is over 5 MB. Split it into smaller files.')
+    if lower.endswith('.xls'):
+        raise Problem("Old .xls files aren't supported. In Excel choose File → Save As → Excel Workbook (.xlsx).")
+    sheets = read_csv(data) if lower.endswith('.csv') else read_xlsx(data)
+    tables = find_tables(sheets)
+    results, counts = [], {'new': 0, 'update': 0, 'same': 0, 'error': 0}
+    with LOCK:
+        conn = sqlite3.connect(str(DB), timeout=10, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute('PRAGMA foreign_keys=ON')
+        try:
+            conn.execute('BEGIN IMMEDIATE')
+            for t in tables:
+                handler = import_design if t['kind'] == 'designs' else import_part
+                for line, rec in t['records']:
+                    conn.execute('SAVEPOINT row')
+                    try:
+                        key, name, action, changes = handler(conn, rec, mode)
+                        conn.execute('RELEASE row')
+                        results.append({'sheet': t['sheet'], 'kind': t['kind'], 'line': line, 'key': key,
+                                        'name': name, 'action': action, 'changes': changes})
+                        counts[action] += 1
+                    except (Problem, sqlite3.IntegrityError) as e:
+                        conn.execute('ROLLBACK TO row')
+                        conn.execute('RELEASE row')
+                        msg = e.msg if isinstance(e, Problem) else 'Value not allowed (' + str(e) + ')'
+                        results.append({'sheet': t['sheet'], 'kind': t['kind'], 'line': line,
+                                        'key': rec.get('code') or rec.get('sku') or '',
+                                        'name': rec.get('name', ''), 'action': 'error', 'error': msg})
+                        counts['error'] += 1
+            if apply and (counts['new'] or counts['update']):
+                audit(conn, 'Bulk upload', f'{filename or "file"}: {counts["new"]} new, {counts["update"]} updated, '
+                      f'{counts["error"]} skipped ({"stock received" if mode == "add" else "stock count"})')
+                conn.execute('COMMIT')
+            else:
+                conn.execute('ROLLBACK')
+        except Exception:
+            if conn.in_transaction:
+                conn.execute('ROLLBACK')
+            raise
+        finally:
+            conn.close()
+    return {'applied': bool(apply), 'counts': counts, 'results': results,
+            'tables': [{'sheet': t['sheet'], 'kind': t['kind'], 'rows': len(t['records'])} for t in tables]}
+
+
+def xlsx_bytes(sheets):
+    """Build a small .xlsx file. sheets = [(name, header list, rows, column widths)]."""
+    def col(i):
+        out, i = '', i + 1
+        while i:
+            i, r = divmod(i - 1, 26)
+            out = chr(65 + r) + out
+        return out
+
+    def cell(ref, value, style=0):
+        s = f' s="{style}"' if style else ''
+        if isinstance(value, bool):
+            value = 'yes' if value else 'no'
+        if isinstance(value, int):
+            return f'<c r="{ref}"{s}><v>{value}</v></c>'
+        if isinstance(value, float):
+            return f'<c r="{ref}"{s}><v>{value:.10g}</v></c>'
+        if value is None or value == '':
+            return ''
+        return f'<c r="{ref}"{s} t="inlineStr"><is><t xml:space="preserve">{xml_escape(str(value))}</t></is></c>'
+
+    head = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    rel = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+    ct = 'application/vnd.openxmlformats-officedocument.spreadsheetml'
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
+        z.writestr('[Content_Types].xml', head
+                   + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                   + '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                   + '<Default Extension="xml" ContentType="application/xml"/>'
+                   + f'<Override PartName="/xl/workbook.xml" ContentType="{ct}.sheet.main+xml"/>'
+                   + f'<Override PartName="/xl/styles.xml" ContentType="{ct}.styles+xml"/>'
+                   + ''.join(f'<Override PartName="/xl/worksheets/sheet{i+1}.xml" ContentType="{ct}.worksheet+xml"/>'
+                             for i in range(len(sheets)))
+                   + '</Types>')
+        z.writestr('_rels/.rels', head + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                   + f'<Relationship Id="rId1" Type="{rel}/officeDocument" Target="xl/workbook.xml"/></Relationships>')
+        z.writestr('xl/workbook.xml', head + f'<workbook xmlns="{NS["m"]}" xmlns:r="{rel}"><sheets>'
+                   + ''.join(f'<sheet name="{xml_escape(s[0])}" sheetId="{i+1}" r:id="rId{i+1}"/>' for i, s in enumerate(sheets))
+                   + '</sheets></workbook>')
+        z.writestr('xl/_rels/workbook.xml.rels', head
+                   + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                   + ''.join(f'<Relationship Id="rId{i+1}" Type="{rel}/worksheet" Target="worksheets/sheet{i+1}.xml"/>'
+                             for i in range(len(sheets)))
+                   + f'<Relationship Id="rId{len(sheets)+1}" Type="{rel}/styles" Target="styles.xml"/></Relationships>')
+        z.writestr('xl/styles.xml', head + f'<styleSheet xmlns="{NS["m"]}">'
+                   + '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font>'
+                   + '<font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font></fonts>'
+                   + '<fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>'
+                   + '<fill><patternFill patternType="solid"><fgColor rgb="FF111111"/></patternFill></fill></fills>'
+                   + '<borders count="1"><border/></borders><cellStyleXfs count="1"><xf/></cellStyleXfs>'
+                   + '<cellXfs count="2"><xf/><xf fontId="1" fillId="2" applyFont="1" applyFill="1"/></cellXfs></styleSheet>')
+        for i, (name, header, rows, widths) in enumerate(sheets):
+            cols = ''.join(f'<col min="{j+1}" max="{j+1}" width="{w}" customWidth="1"/>' for j, w in enumerate(widths))
+            data = ['<row r="1">' + ''.join(cell(f'{col(j)}1', h, 1) for j, h in enumerate(header)) + '</row>']
+            for r, values in enumerate(rows, start=2):
+                data.append(f'<row r="{r}">' + ''.join(cell(f'{col(j)}{r}', v) for j, v in enumerate(values)) + '</row>')
+            z.writestr(f'xl/worksheets/sheet{i+1}.xml', head + f'<worksheet xmlns="{NS["m"]}">'
+                       + '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
+                       + f'<cols>{cols}</cols><sheetData>' + ''.join(data) + '</sheetData></worksheet>')
+    return buf.getvalue()
+
+
+def stock_workbook():
+    st = state()
+    first_supplier = {}
+    for s in st['suppliers']:
+        first_supplier.setdefault(s['component_id'], s)
+    blank = lambda v: '' if v is None else v
+    parts = []
+    for c in st['components']:
+        s = first_supplier.get(c['id'])
+        parts.append([c['code'], c['name'], c['unit'], c['qty'], c['min_qty'] or '',
+                      c['purchase_multiplier'], c['purchase_unit'],
+                      s['name'] if s else '', s['price'] if s else '', s['url'] if s else ''])
+    designs = [[k['sku'], k['name'], k['size'], k['packed_qty'] if k['stock_counted'] else '',
+                blank(k['paint_colours']), k['subtitle'], k['barcode'], blank(k['mrp']), blank(k['selling_price'])]
+               for k in st['kits']]
+    guide = [[line] for line in (
+        '1. Change the numbers in "Stock quantity" (Parts sheet) or "Packed stock" (Designs sheet). Leave a cell empty to keep it as it is.',
+        '2. Add new rows at the bottom for new parts or designs. A new part needs Part code, Part name and Unit (pcs, set, strip, tube, cm, ml or g).',
+        '3. In the app open Bulk upload, drop this file in, and choose "Stock count" (replace the numbers) or "Stock received" (add the numbers).',
+        '4. Check the preview, then press Save. Nothing changes until you press Save.',
+        '5. Fill in Supplier, Price per unit and Reorder link to save a reorder link for a part.',
+        'Note: uploading packed stock does not deduct parts. Use Pack orders for kits you pack.',
+    )]
+    return xlsx_bytes([
+        ('Parts', [h for _, h in PART_COLUMNS], parts, [24, 44, 8, 15, 14, 18, 16, 20, 18, 44]),
+        ('Designs', [h for _, h in DESIGN_COLUMNS], designs, [18, 30, 7, 14, 14, 36, 26, 10, 14]),
+        ('How to use', ['How to use this file'], guide, [130]),
+    ])
+
+
 def route(method,path,body):
     if method=='GET' and path=='/api/state':
         return state()
@@ -839,6 +1283,8 @@ def route(method,path,body):
     if path=='/api/convert': return convert_component(body)
     if path=='/api/suppliers': return create_supplier(body)
     if path=='/api/pack-batch': return pack_batch(body)
+    if path=='/api/import/preview': return bulk_import(body, False)
+    if path=='/api/import/apply': return bulk_import(body, True)
     m=re.fullmatch(r'/api/kits/(\d+)/(recipe|confirm-recipe|pack|handover|count)',path)
     if m:
         kid=int(m.group(1)); action=m.group(2)
@@ -977,6 +1423,17 @@ class AppHandler(BaseHTTPRequestHandler):
             return self.send_bytes(200,(ROOT/'static'/name).read_bytes(),kind)
         if not self.check_authorized(path):
             return
+        if path=='/api/export.xlsx':
+            content=stock_workbook()
+            self.send_response(200)
+            self.send_header('Content-Type','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+            self.send_header('Content-Disposition',f'attachment; filename="aurva-stock-{datetime.now().strftime("%Y-%m-%d")}.xlsx"')
+            self.send_header('Cache-Control','no-store')
+            self.send_header('X-Content-Type-Options','nosniff')
+            self.send_header('Content-Length',str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+            return
         if path.startswith('/api/'):
             return self.handle_api('GET',path,{})
         if path not in self.PRIVATE:
@@ -996,7 +1453,7 @@ class AppHandler(BaseHTTPRequestHandler):
             return self.json_result(415,{'error':'Use Content-Type: application/json.'})
         try:
             length=int(self.headers.get('Content-Length','0'))
-            if length>65536:
+            if length>(8*1024*1024 if path.startswith('/api/import/') else 65536):
                 raise Problem('Request too large.',413)
             body=json.loads(self.rfile.read(length) or b'{}')
             if not isinstance(body,dict):

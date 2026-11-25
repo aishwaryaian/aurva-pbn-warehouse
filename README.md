@@ -36,6 +36,7 @@ The sidebar in the app always shows the database path in use.
 - **Pack orders**: type how many kits you packed for each design and save. Every part in that design's recipe is deducted automatically, including paint strips. Switch to *Sent out / handed over* to reduce packed stock.
 - **Low-stock alerts**: a design alerts at **10 or fewer** packed kits. A part alerts when only enough is left for 10 kits (for example 20 hooks or 500 cm cord), or at your own minimum if you set one.
 - **Reorder links**: save supplier links and prices per part; low parts are listed first with a one-click *Reorder* button.
+- **Bulk upload (Excel)**: download the stock sheet, change the numbers in Excel, then drag the file onto the Bulk upload page (or press Upload file). Choose *Stock count* to replace quantities or *Stock received* to add to them. A preview shows every change before you press Save. Works with `.xlsx` and `.csv`; uploading packed stock doesn't deduct parts.
 - **Unlock packing**: designs whose adhesive use isn't measured yet start locked. *Unlock packing* lets you pack them now without deducting adhesive.
 
 **Test:** `python test_app.py` runs a temporary local smoke test.

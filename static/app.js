@@ -6,6 +6,7 @@ let PACK_MODE = 'pack';           // 'pack' = packed (uses parts) | 'handover' =
 let PACK_QTY = {};                // kit id -> number typed on Pack orders page
 let REORDER_FILTER = 'low';
 let TOAST_TIMEOUT;
+let UPLOAD = {file: null, name: '', data: '', mode: 'set', preview: null, busy: false, showSame: false, error: ''};
 
 const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => Array.from(root.querySelectorAll(s));
@@ -91,6 +92,7 @@ const PAGES = {
   kits: ['Catalogue', 'Designs', 'Every PBN design, its packed stock, prices and parts recipe.'],
   components: ['Inventory', 'Parts stock', 'Canvases, strips, brushes, tubes and everything else that goes into a kit.'],
   reorder: ['Purchasing', 'Reorder links', 'Saved supplier links for every part. Low-stock parts are listed first.'],
+  upload: ['Excel', 'Bulk upload', 'Update stock for many parts and designs at once from an Excel sheet.'],
   activity: ['History', 'Activity', 'Every packing, handover and stock change, newest first.'],
 };
 function render() {
@@ -101,7 +103,7 @@ function render() {
   const parts = lowParts().length;
   for (const id of ['#count-parts', '#count-reorder']) { const el = $(id); el.textContent = parts; el.classList.toggle('hidden', !parts); }
   renderDb();
-  $('#content').innerHTML = ({dashboard: renderDashboard, pack: renderPack, kits: renderKits, components: renderComponents, reorder: renderReorder, activity: renderActivity})[TAB]();
+  $('#content').innerHTML = ({dashboard: renderDashboard, pack: renderPack, kits: renderKits, components: renderComponents, reorder: renderReorder, upload: renderUpload, activity: renderActivity})[TAB]();
   paintBars();
   if (TAB === 'pack') updatePackSummary();
 }
@@ -249,7 +251,7 @@ function componentRow(c) {
 function renderComponents() {
   const comps = DATA.components.filter(c => `${c.name} ${c.code}`.toLowerCase().includes(SEARCH.toLowerCase()))
     .sort((a, b) => (b.low_stock - a.low_stock) || a.name.localeCompare(b.name));
-  return `<div class="toolbar"><input class="input search" id="list-search" placeholder="Search parts" value="${esc(SEARCH)}" aria-label="Search parts"><div class="toolbar-actions"><button class="btn btn-secondary" data-action="convert">Split stock</button><button class="btn btn-primary" data-action="new-component">+ Add part</button></div></div>
+  return `<div class="toolbar"><input class="input search" id="list-search" placeholder="Search parts" value="${esc(SEARCH)}" aria-label="Search parts"><div class="toolbar-actions"><button class="btn btn-secondary" data-tab="upload">Excel upload</button><button class="btn btn-secondary" data-action="convert">Split stock</button><button class="btn btn-primary" data-action="new-component">+ Add part</button></div></div>
   <div class="notice">Parts alert when there’s only enough left for <b>${DATA.threshold} kits</b> (e.g. 20 hooks, 500 cm cord). Set your own minimum for any part with <b>Edit</b>.</div>
   <section class="panel">${panelHead('All parts', `${plural(comps.length, 'part')} · ${lowParts().length} need reordering`)}
   <div class="table-scroll"><table><thead><tr><th>Part</th><th>In stock</th><th>Status</th><th class="num">Used in</th><th class="actions"></th></tr></thead><tbody>${comps.map(componentRow).join('')}</tbody></table></div></section>`;
@@ -272,6 +274,73 @@ function renderReorder() {
   const f = (key, label) => `<button class="${REORDER_FILTER === key ? 'on' : ''}" data-action="reorder-filter" data-filter="${key}">${label}</button>`;
   return `<div class="toolbar"><div class="segmented">${f('low', `Needs reorder (${lowParts().length})`)}${f('links', 'Has a link')}${f('all', 'All parts')}</div><div class="toolbar-actions"><input class="input search" id="list-search" placeholder="Search parts or suppliers" value="${esc(SEARCH)}" aria-label="Search"><button class="btn btn-primary" data-action="new-supplier">+ Add link</button></div></div>
   <section class="panel">${comps.length ? `<div class="table-scroll"><table><thead><tr><th>Part</th><th>Stock</th><th class="actions">Supplier links</th></tr></thead><tbody>${rows}</tbody></table></div>` : empty(REORDER_FILTER === 'low' ? 'Nothing needs reordering' : 'No parts here yet', REORDER_FILTER === 'low' ? 'All parts are above their alert level.' : 'Add a supplier link to any part.')}</section>`;
+}
+
+
+/* ---------- Bulk upload ---------- */
+function renderUpload() {
+  const u = UPLOAD, p = u.preview;
+  const modeBtn = (m, label, hint) => `<button class="mode-card ${u.mode === m ? 'on' : ''}" data-action="upload-mode" data-mode="${m}" aria-pressed="${u.mode === m}"><b>${label}</b><span>${hint}</span></button>`;
+  let previewHtml = '';
+  if (u.busy) previewHtml = `<div class="loading">Reading ${esc(u.name)}…</div>`;
+  else if (u.error) previewHtml = `<div class="notice bad"><b>Couldn’t read this file.</b> ${esc(u.error)}</div>`;
+  else if (p) {
+    const c = p.counts;
+    const rows = p.results.filter(r => u.showSame || r.action !== 'same');
+    const tag = r => r.action === 'new' ? pill('New', '') : r.action === 'update' ? pill('Change', 'warn') : r.action === 'error' ? pill('Error', 'bad') : pill('No change', 'neutral');
+    const body = rows.map(r => `<tr class="${r.action === 'error' ? 'err' : ''}"><td class="mono">${esc(r.sheet)} · row ${r.line}</td><td><span class="row-title">${esc(r.name || r.key)}</span><span class="mono">${esc(r.key)}</span></td><td>${tag(r)}</td><td>${r.action === 'error' ? `<span class="qty-bad">${esc(r.error)}</span>` : esc((r.changes || []).join(' · ') || '—')}</td></tr>`).join('');
+    const ready = c.new + c.update;
+    previewHtml = `${p.applied ? `<div class="notice ok"><b>Saved.</b> ${plural(c.new, 'new item')} added and ${plural(c.update, 'item')} updated${c.error ? `; ${plural(c.error, 'row')} skipped because of errors` : ''}.</div>` : ''}
+      <div class="stats small">
+        <div class="stat"><div class="label">New</div><div class="value">${fmt(c.new)}</div></div>
+        <div class="stat"><div class="label">Changes</div><div class="value">${fmt(c.update)}</div></div>
+        <div class="stat"><div class="label">No change</div><div class="value">${fmt(c.same)}</div></div>
+        <div class="stat ${c.error ? 'bad' : ''}"><div class="label">Errors</div><div class="value">${fmt(c.error)}</div></div>
+      </div>
+      <section class="panel">${panelHead(p.applied ? 'What was saved' : 'Preview — nothing is saved yet', `${esc(u.name)} · ${p.tables.map(t => `${esc(t.sheet)} (${t.rows} rows, ${t.kind})`).join(', ')}`, `<label class="check"><input type="checkbox" data-action="upload-same" ${u.showSame ? 'checked' : ''}> Show unchanged rows</label>`)}
+        ${rows.length ? `<div class="table-scroll"><table><thead><tr><th>Where</th><th>Item</th><th>Result</th><th>Details</th></tr></thead><tbody>${body}</tbody></table></div>` : empty('Nothing to change', 'Every row already matches what’s in the app.')}
+      </section>
+      ${p.applied ? `<div class="form-buttons"><button class="btn btn-secondary" data-action="upload-reset">Upload another file</button><button class="btn btn-primary" data-tab="components">See parts stock</button></div>`
+        : `<div class="pack-bar"><div class="summary"><b>${plural(ready, 'row')}</b> will be saved as <b>${u.mode === 'add' ? 'stock received (added)' : 'a stock count (replaced)'}</b>${c.error ? ` · ${c.error} with errors will be skipped` : ''}</div><div class="toolbar-actions"><button class="btn btn-small btn-ghost" data-action="upload-reset">Cancel</button><button class="btn" data-action="upload-apply" ${ready ? '' : 'disabled'}>Save to stock</button></div></div>`}`;
+  }
+  return `<div class="upload-grid">
+    <section class="panel step"><span class="step-num">1</span><div><h2>Get the Excel sheet</h2><p class="muted">It has your current parts and designs, so you only change the numbers. You can also use your own sheet with a “Part code” or “SKU” column.</p>
+      <a class="btn btn-secondary" href="/api/export.xlsx" download>Download Excel ↓</a></div></section>
+    <section class="panel step"><span class="step-num">2</span><div><h2>What are the numbers?</h2><div class="mode-cards">${modeBtn('set', 'Stock count', 'Replace stock with these numbers')}${modeBtn('add', 'Stock received', 'Add these numbers to stock')}</div></div></section>
+  </div>
+  <label class="dropzone ${u.name ? 'has-file' : ''}" id="dropzone" for="upload-input">
+    <input type="file" id="upload-input" accept=".xlsx,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv" class="sr-only">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 15V3M7 8l5-5 5 5"/><path d="M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/></svg>
+    <b>${u.name ? esc(u.name) : 'Drag & drop your Excel file here'}</b>
+    <span class="muted">${u.name ? 'Drop another file or click to change it' : '.xlsx or .csv, up to 5 MB'}</span>
+    <span class="btn btn-primary">${u.name ? 'Choose a different file' : 'Upload file'}</span>
+  </label>
+  ${previewHtml}`;
+}
+function readUpload(file) {
+  if (!file) return;
+  if (!/\.(xlsx|csv)$/i.test(file.name)) { toast(/\.xls$/i.test(file.name) ? 'Old .xls files aren’t supported. In Excel use File → Save As → Excel Workbook (.xlsx).' : 'Please choose an Excel (.xlsx) or .csv file.', true); return; }
+  if (file.size > 5 * 1024 * 1024) { toast('That file is over 5 MB.', true); return; }
+  const reader = new FileReader();
+  reader.onload = () => { UPLOAD = {...UPLOAD, file, name: file.name, data: String(reader.result).split(',')[1] || '', preview: null, error: ''}; uploadPreview(); };
+  reader.onerror = () => toast('Couldn’t read that file.', true);
+  reader.readAsDataURL(file);
+}
+async function uploadPreview() {
+  if (!UPLOAD.data) { render(); return; }
+  UPLOAD.busy = true; UPLOAD.error = ''; render();
+  try { UPLOAD.preview = await request('/api/import/preview', {filename: UPLOAD.name, data: UPLOAD.data, mode: UPLOAD.mode}); }
+  catch (e) { UPLOAD.error = e.message; UPLOAD.preview = null; }
+  UPLOAD.busy = false; render();
+}
+async function uploadApply(btn) {
+  btn.disabled = true;
+  try {
+    const r = await request('/api/import/apply', {filename: UPLOAD.name, data: UPLOAD.data, mode: UPLOAD.mode});
+    UPLOAD.preview = r; UPLOAD.data = '';
+    await load();
+    toast(`Saved: ${r.counts.new} new, ${r.counts.update} updated.`);
+  } catch (e) { toast(e.message, true); btn.disabled = false; }
 }
 
 /* ---------- Activity ---------- */
@@ -450,6 +519,9 @@ async function runAction(action, id, el) {
       const inp = $(`.pack-input[data-id="${id}"]`); if (inp) inp.value = next || '';
       updatePackSummary(); break;
     }
+    case 'upload-mode': UPLOAD.mode = el.dataset.mode; if (UPLOAD.data) await uploadPreview(); else render(); break;
+    case 'upload-reset': UPLOAD = {file: null, name: '', data: '', mode: UPLOAD.mode, preview: null, busy: false, showSame: false, error: ''}; render(); break;
+    case 'upload-apply': await uploadApply(el); break;
     case 'unlock': unlockKit(kitById(id)); break;
     case 'unlock-confirm':
       el.disabled = true;
@@ -463,7 +535,7 @@ document.addEventListener('click', ev => {
   const tab = ev.target.closest('[data-tab]');
   if (tab) { TAB = tab.dataset.tab; SEARCH = ''; closeModal(); render(); window.scrollTo({top: 0}); try { history.replaceState(null, '', '#' + TAB); } catch (e) {} return; }
   const a = ev.target.closest('[data-action]');
-  if (a && !a.disabled) { ev.preventDefault(); runAction(a.dataset.action, a.dataset.id, a).catch(err => { toast(err.message, true); a.disabled = false; }); }
+  if (a && !a.disabled && a.type !== 'checkbox') { ev.preventDefault(); runAction(a.dataset.action, a.dataset.id, a).catch(err => { toast(err.message, true); a.disabled = false; }); }
   if (ev.target.id === 'modal-overlay') closeModal();
 });
 document.addEventListener('input', ev => {
@@ -478,6 +550,19 @@ document.addEventListener('input', ev => {
   }
 });
 document.addEventListener('keydown', ev => { if (ev.key === 'Escape') closeModal(); });
+document.addEventListener('change', ev => {
+  if (ev.target.id === 'upload-input') { readUpload(ev.target.files[0]); ev.target.value = ''; }
+  if (ev.target.dataset.action === 'upload-same') { UPLOAD.showSame = ev.target.checked; render(); }
+});
+let dragDepth = 0;
+document.addEventListener('dragenter', ev => { if (TAB !== 'upload' || !ev.dataTransfer?.types?.includes('Files')) return; ev.preventDefault(); dragDepth++; $('#dropzone')?.classList.add('drag'); });
+document.addEventListener('dragover', ev => { if (TAB === 'upload') ev.preventDefault(); });
+document.addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; $('#dropzone')?.classList.remove('drag'); } });
+document.addEventListener('drop', ev => {
+  if (TAB !== 'upload') return;
+  ev.preventDefault(); dragDepth = 0; $('#dropzone')?.classList.remove('drag');
+  readUpload(ev.dataTransfer?.files?.[0]);
+});
 
 const startTab = location.hash.slice(1);
 if (PAGES[startTab]) TAB = startTab;

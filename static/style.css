@@ -303,3 +303,27 @@ tbody tr:hover td{background:var(--surface-2)}
 .pack-bar .btn:disabled{opacity:.35}
 .toolbar-actions .search{flex:1 1 260px;width:auto}
 @media (min-width:761px){.toolbar-actions{flex-wrap:nowrap}}
+
+/* ---------- Bulk upload ---------- */
+.upload-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}
+.step{display:flex;gap:14px;align-items:flex-start}
+.step h2{font-size:16px;font-weight:800;margin-bottom:4px}
+.step p{font-size:13px;margin-bottom:14px}
+.step-num{flex:none;width:30px;height:30px;border-radius:9px;display:grid;place-items:center;background:var(--accent);color:var(--accent-ink);font-weight:800}
+.mode-cards{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
+.mode-card{text-align:left;border:1.5px solid var(--line-strong);background:var(--surface);border-radius:12px;padding:11px 13px;display:grid;gap:2px}
+.mode-card b{font-size:13.5px}.mode-card span{font-size:12px;color:var(--muted)}
+.mode-card.on{border-color:var(--ink);box-shadow:0 0 0 1px var(--ink) inset}
+.dropzone{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;text-align:center;border:2px dashed var(--line-strong);border-radius:var(--radius);background:var(--surface);padding:40px 20px;cursor:pointer;margin-bottom:18px;transition:border-color .15s,background .15s}
+.dropzone svg{width:40px;height:40px;color:var(--muted)}
+.dropzone b{font-size:16px}
+.dropzone .btn{margin-top:6px}
+.dropzone:hover,.dropzone.drag{border-color:var(--ink);background:var(--surface-2)}
+.dropzone.drag{border-style:solid}
+.dropzone.has-file{padding:24px 20px}
+.dropzone:focus-within{outline:2px solid var(--focus);outline-offset:2px}
+.stats.small .stat{padding:14px 16px}.stats.small .value{font-size:26px;margin:6px 0 0}
+.notice.ok{border-color:color-mix(in srgb,var(--ok) 30%,var(--line));background:var(--ok-bg);color:var(--ok)}
+tr.err td{background:color-mix(in srgb,var(--bad-bg) 50%,transparent)}
+.check{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--muted);white-space:nowrap;cursor:pointer}
+@media (max-width:760px){.upload-grid,.mode-cards{grid-template-columns:1fr}}
